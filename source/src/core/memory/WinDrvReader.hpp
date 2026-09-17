@@ -16,20 +16,43 @@
 #include <lazy_importer/lazy_importer.hpp>
 #include "core/anti_debug/AntiDebug.hpp"
 
-// fekern(2).sys (Microsoft WHQL, Feb 2025) – MmCopyMemory(MM_COPY_MEMORY_PHYSICAL)
-// HVCI/VBS-compatible: no new PTEs or SLAT entries created.
-// IOCTL 0x70F8800C (MRT_IOCTL_READ_PHYSICALMEMORY): copies physAddr..+size into output buffer.
-// InputBufferLength must be exactly 16. OutputBufferLength = bytesToRead.
-#define IOCTL_FEKERN_READ_PHYS  0x70F8800Cu
+// iqvw64e.sys (Intel Network Adapter Diagnostic Driver, WHQL-signed).
+// Single IOCTL 0x80862007 dispatched by an in-struct case_number:
+//   0x19  MmMapIoSpace(phys, size)   -> returns kernel VA of the mapping
+//   0x33  memcpy(dst, src, length)   -> arbitrary VAs, executed in kernel context
+//   0x1A  MmUnmapIoSpace(va, size)   -> releases the mapping
+// PhysRead is: map page -> memcpy(kernelVA -> user buffer) -> unmap.
+// The phys-page LRU in PhysRead() absorbs the 3x IOCTL cost per uncached page.
+#define IOCTL_NAL                       0x80862007u
+#define NAL_CASE_MAP_IO_SPACE           0x19u
+#define NAL_CASE_MEMCPY                 0x33u
+#define NAL_CASE_UNMAP_IO_SPACE         0x1Au
 
 #pragma pack(push, 1)
-struct FekernReadIn {
-    uint64_t phys_addr;    // +0x00 INPUT: target physical address
-    uint32_t bytes_to_read;// +0x08 INPUT: byte count (== OutputBufferLength)
-    uint32_t pad;          // +0x0C zero
+struct NalMapIoSpace {
+    uint64_t case_number;               // +0x00 = 0x19
+    uint64_t reserved;                  // +0x08
+    uint64_t return_value;              // +0x10 OUT: NTSTATUS-ish
+    uint64_t return_virtual_address;    // +0x18 OUT: mapped kernel VA
+    uint64_t physical_address_to_map;   // +0x20 IN
+    uint32_t size;                      // +0x28 IN
+};
+struct NalMemCopy {
+    uint64_t case_number;               // +0x00 = 0x33
+    uint64_t reserved;                  // +0x08
+    uint64_t source;                    // +0x10 IN
+    uint64_t destination;               // +0x18 IN
+    uint64_t length;                    // +0x20 IN
+};
+struct NalUnmapIoSpace {
+    uint64_t case_number;               // +0x00 = 0x1A
+    uint64_t reserved1;                 // +0x08
+    uint64_t reserved2;                 // +0x10
+    uint64_t virt_address;              // +0x18 IN
+    uint64_t reserved3;                 // +0x20
+    uint64_t number_of_bytes;           // +0x28 IN
 };
 #pragma pack(pop)
-static_assert(sizeof(FekernReadIn) == 16, "FekernReadIn size mismatch");
 
 class WinDrvReader {
 public:
@@ -41,26 +64,26 @@ public:
 
     bool Open() {
         if (IsOpen()) return true;
-        DBG_PRINT("[fekern] Opening device...\n");
-        m_hDevice = CreateFileA(skCrypt("\\\\.\\fekern_00"),
+        DBG_PRINT("[nal] Opening device...\n");
+        m_hDevice = CreateFileA(skCrypt("\\\\.\\Nal"),
                                 GENERIC_READ | GENERIC_WRITE,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                                 nullptr, OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL, nullptr);
         if (m_hDevice == INVALID_HANDLE_VALUE) {
             DWORD err = GetLastError();
-            DBG_PRINT("[fekern] Failed to open device: err=%lu\n", err);
-            if (err == 2) DBG_PRINT("[fekern]   (device not found — driver not loaded)\n");
-            else if (err == 5) DBG_PRINT("[fekern]   (access denied — need admin or MRT collision)\n");
+            DBG_PRINT("[nal] Failed to open device: err=%lu\n", err);
+            if (err == 2) DBG_PRINT("[nal]   (device not found -- driver not loaded)\n");
+            else if (err == 5) DBG_PRINT("[nal]   (access denied -- need admin or handle already held)\n");
             return false;
         }
-        DBG_PRINT("[fekern] Device opened: handle=0x%p\n", (void*)m_hDevice);
-        // Probe: try reading physical page 0x1000 to verify IOCTL actually works
+        DBG_PRINT("[nal] Device opened: handle=0x%p\n", (void*)m_hDevice);
+        // Probe: try reading physical page 0x1000 to verify IOCTL chain actually works
         uint8_t probe[4096];
-        if (!FekernReadPage(0x1000, probe)) {
-            printf(skCrypt("[SysMonitor] IOCTL probe at PA=0x1000 FAILED (err=%lu) — driver loaded but reads blocked\n"), GetLastError());
+        if (!NalReadPage(0x1000, probe)) {
+            printf(skCrypt("[SysMonitor] Nal IOCTL probe at PA=0x1000 FAILED (err=%lu) -- driver loaded but map/copy blocked\n"), GetLastError());
         } else {
-            printf(skCrypt("[SysMonitor] IOCTL probe OK (first 8 bytes: %02X %02X %02X %02X %02X %02X %02X %02X)\n"),
+            printf(skCrypt("[SysMonitor] Nal IOCTL probe OK (first 8 bytes: %02X %02X %02X %02X %02X %02X %02X %02X)\n"),
                 probe[0], probe[1], probe[2], probe[3],
                 probe[4], probe[5], probe[6], probe[7]);
         }
@@ -710,7 +733,7 @@ public:
 
             if (!hit) {
                 uint8_t page[4096];
-                if (!FekernReadPage(pagePA, page)) return false;
+                if (!NalReadPage(pagePA, page)) return false;
                 EnterCriticalSection(&m_physLock);
                 int slot = m_physPageHead;
                 m_physPageHead = (m_physPageHead + 1) % kPhysPageCacheN;
@@ -733,14 +756,14 @@ private:
     WinDrvReader(const WinDrvReader&) = delete;
     WinDrvReader& operator=(const WinDrvReader&) = delete;
 
-    bool FekernReadPage(uint64_t pagePA, uint8_t out[4096]) {
+    bool NalReadPage(uint64_t pagePA, uint8_t out[4096]) {
         HANDLE hUse = INVALID_HANDLE_VALUE;
         bool   ownedOpen = false;
         if (m_idleMode) {
             // Serialise idle-mode opens: Cache and Renderer threads both call this.
             EnterCriticalSection(&m_physLock);
             if (!IsOpen()) {
-                m_hDevice = CreateFileA(skCrypt("\\\\.\\fekern_00"),
+                m_hDevice = CreateFileA(skCrypt("\\\\.\\Nal"),
                                         GENERIC_READ | GENERIC_WRITE,
                                         FILE_SHARE_READ | FILE_SHARE_WRITE,
                                         nullptr, OPEN_EXISTING,
@@ -753,26 +776,68 @@ private:
         } else {
             hUse = m_hDevice;
         }
-        FekernReadIn in = {};
-        in.phys_addr     = pagePA & ~0xFFFULL;
-        in.bytes_to_read = 4096;
+
+        pagePA &= ~0xFFFULL;
+
+        // Step 1: MmMapIoSpace(pagePA, 4096) -> kernel VA
+        NalMapIoSpace map = {};
+        map.case_number             = NAL_CASE_MAP_IO_SPACE;
+        map.physical_address_to_map = pagePA;
+        map.size                    = 4096;
         DWORD returned = 0;
-        bool ok = DeviceIoControl(hUse, IOCTL_FEKERN_READ_PHYS,
-                                  &in,  (DWORD)sizeof(in),
-                                  out,  4096,
+        bool ok = DeviceIoControl(hUse, IOCTL_NAL,
+                                  &map, (DWORD)sizeof(map),
+                                  &map, (DWORD)sizeof(map),
                                   &returned, nullptr) != FALSE;
+        uint64_t kva = map.return_virtual_address;
+        if (!ok || !kva) {
+            static bool s_logged = false;
+            if (!s_logged) {
+                s_logged = true;
+                printf(skCrypt("[SysMonitor] Nal MmMapIoSpace failed: err=%lu (PA=0x%llX, kva=0x%llX)\n"),
+                       GetLastError(), (unsigned long long)pagePA, (unsigned long long)kva);
+            }
+            if (ownedOpen) {
+                EnterCriticalSection(&m_physLock);
+                CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE;
+                LeaveCriticalSection(&m_physLock);
+            }
+            return false;
+        }
+
+        // Step 2: memcpy(user_out, kva, 4096) -- executed in kernel context, user VA
+        // is accessible because the caller owns this process. length is 8 bytes here.
+        NalMemCopy copy = {};
+        copy.case_number = NAL_CASE_MEMCPY;
+        copy.source      = kva;
+        copy.destination = reinterpret_cast<uint64_t>(out);
+        copy.length      = 4096;
+        ok = DeviceIoControl(hUse, IOCTL_NAL,
+                             &copy, (DWORD)sizeof(copy),
+                             &copy, (DWORD)sizeof(copy),
+                             &returned, nullptr) != FALSE;
         if (!ok) {
             static bool s_logged = false;
             if (!s_logged) {
                 s_logged = true;
-                printf(skCrypt("[SysMonitor] IOCTL_FEKERN_READ_PHYS failed: err=%lu (PA=0x%llX, returned=%lu)\n"),
-                       GetLastError(), (unsigned long long)pagePA, (unsigned long)returned);
+                printf(skCrypt("[SysMonitor] Nal memcpy failed: err=%lu (PA=0x%llX, kva=0x%llX)\n"),
+                       GetLastError(), (unsigned long long)pagePA, (unsigned long long)kva);
             }
         }
+
+        // Step 3: MmUnmapIoSpace(kva, 4096) -- always attempt, even if memcpy failed.
+        NalUnmapIoSpace unmap = {};
+        unmap.case_number     = NAL_CASE_UNMAP_IO_SPACE;
+        unmap.virt_address    = kva;
+        unmap.number_of_bytes = 4096;
+        DeviceIoControl(hUse, IOCTL_NAL,
+                        &unmap, (DWORD)sizeof(unmap),
+                        &unmap, (DWORD)sizeof(unmap),
+                        &returned, nullptr);
+
         if (ownedOpen) {
             EnterCriticalSection(&m_physLock);
-            CloseHandle(m_hDevice);
-            m_hDevice = INVALID_HANDLE_VALUE;
+            CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE;
             LeaveCriticalSection(&m_physLock);
         }
         return ok;

