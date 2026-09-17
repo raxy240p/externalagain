@@ -4,6 +4,7 @@
 #include <winternl.h>
 #include <intrin.h>
 #include <tlhelp32.h>
+#include <cstdio>
 #include <lazy_importer/lazy_importer.hpp>
 #include <skCrypter/skCrypter.hpp>
 #include "Opaque.hpp"
@@ -600,39 +601,49 @@ inline void Assert() {
 
     // Each check is gated behind an opaque true predicate so the decompiler
     // sees multiple conditionally-executed code paths. All are always taken.
-    bool caught = false;
-
-    if (OP_TRUE()) {
-        if (OP_TRUE()) caught = caught || PebCheck();
-        if (OP_TRUE()) caught = caught || NtipCheck();
-        if (OP_TRUE()) caught = caught || KernelDbgCheck();
-        AD_JUNK();
-        if (OP_TRUE()) caught = caught || NtCloseCheck();
-        if (OP_TRUE()) caught = caught || HardwareBreakpointCheck();
-    } else {
-        // Opaque fork: identical checks that decompiler can't statically merge
-        caught = PebCheck() || NtipCheck() || KernelDbgCheck();
-    }
-
-    if (OP_TRUE()) {
-        // AntiHookCheck() removed: AV inline hooks in ntdll stubs survive "disable
-        // real-time protection" — hooks are installed by the AV kernel driver at boot
-        // and only removed on full driver unload/reboot. This caused false-positive
-        // CRASH() on any system with AV installed, even with protection disabled.
-        // VMProtect virtualization covers the same attack surface without the FP.
-        caught = caught || TimingCheck();
-        caught = caught || VMCheck();
-        caught = caught || BlacklistCheck();
-    }
-
+    // Named enumeration replaces the old opaque or-chain: on a trip we know
+    // which check fired, print it before the __fastfail, and let a debug
+    // build continue past instead of dying invisibly.
+    struct Trip { const char* name; bool hit; };
+    Trip trips[] = {
+        { "PebCheck",                 PebCheck()                 },
+        { "NtipCheck",                NtipCheck()                },
+        { "KernelDbgCheck",           KernelDbgCheck()           },
+        { "NtCloseCheck",             NtCloseCheck()             },
+        { "HardwareBreakpointCheck",  HardwareBreakpointCheck()  },
+        { "TimingCheck",              TimingCheck()              },
+        { "VMCheck",                  VMCheck()                  },
+        { "BlacklistCheck",           BlacklistCheck()           },
+        { "KernelModuleBlacklistCheck", KernelModuleBlacklistCheck() },
+    };
     AD_JUNK();
 
-    // Kernel module check via NtQuerySystemInformation (not EnumDeviceDrivers)
-    if (OP_TRUE()) {
-        if (KernelModuleBlacklistCheck()) CRASH();
+    bool caught = false;
+    for (auto& t : trips) if (t.hit) {
+        caught = true;
+        fprintf(stderr, "[AntiDebug] tripped: %s\n", t.name);
     }
+    fflush(stderr);
 
-    if (caught) CRASH();
+    // AntiHookCheck() removed: AV inline hooks in ntdll stubs survive "disable
+    // real-time protection" — hooks are installed by the AV kernel driver at boot
+    // and only removed on full driver unload/reboot. This caused false-positive
+    // CRASH() on any system with AV installed, even with protection disabled.
+    // VMProtect virtualization covers the same attack surface without the FP.
+
+    if (!caught) return;
+
+#ifdef NDEBUG
+    // Release: give the console 3 s to render the trip name before __fastfail
+    // burns the process. Without this delay the exit is invisible.
+    Sleep(3000);
+    CRASH();
+#else
+    // Debug: soft-warn and continue so dev tools (debugger, VM, ReClass,
+    // Process Hacker, etc.) don't kill iteration.
+    fprintf(stderr, "[AntiDebug] debug build — continuing past trip\n");
+    fflush(stderr);
+#endif
 }
 
 // ── Late hardening — call after engine+renderer are up ───────────────────────
@@ -646,8 +657,19 @@ inline void LateHarden() {
 
 // ── Periodic check (cache loop) ───────────────────────────────────────────────
 __forceinline void Tick() {
-    if (PebCheck() || HardwareBreakpointCheck() || NtipCheck())
-        CRASH();
+    const char* which = nullptr;
+    if      (PebCheck())                which = "Tick/PebCheck";
+    else if (HardwareBreakpointCheck()) which = "Tick/HardwareBreakpointCheck";
+    else if (NtipCheck())               which = "Tick/NtipCheck";
+    if (!which) return;
+#ifdef NDEBUG
+    fprintf(stderr, "[AntiDebug] tripped: %s\n", which);
+    fflush(stderr);
+    Sleep(3000);
+    CRASH();
+#else
+    (void)which;  // silent in debug — Tick fires per-frame, no spam
+#endif
 }
 
 #undef AD_API
