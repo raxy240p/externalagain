@@ -1,0 +1,354 @@
+#include "Esp.hpp"
+#include <skCrypter/skCrypter.hpp>
+#include "core/engine/DebugEsp.hpp"
+#include "core/engine/Engine.hpp"
+#include "core/offsets/Offsets.hpp"
+#include "core/engine/classes/Game.hpp"
+#include <chrono>
+#include <cmath>
+#include <vector>
+#include "gui/renderer/Renderer.hpp"
+
+bool Esp::Init()   { return GetInstance().InitImpl();   }
+void Esp::Render() { return GetInstance().RenderImpl(); }
+
+bool Esp::InitImpl() {
+	ImFontConfig fcfg{};
+	fcfg.FontDataOwnedByAtlas = false;
+	this->font = ImGui::GetIO().Fonts->AddFontFromFileTTF(
+		skCrypt("C:\\Windows\\Fonts\\consola.ttf"), 12.0f, &fcfg);
+	return this->font != nullptr;
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+static inline ImU32 MakeCol(ImColor c) { return (ImU32)c; }
+
+static inline bool BoneValid(const Vec3_t& b) {
+	return (b.x != 0.f) | (b.y != 0.f) | (b.z != 0.f);
+}
+
+static inline float HalfX(const std::pair<Vec2_t,Vec2_t>& r) {
+	return r.first.x + (r.second.x - r.first.x) * 0.5f;
+}
+
+static inline ImVec2 RightFlagPos(const std::pair<Vec2_t,Vec2_t>& b, int row, float ts) {
+	float step = ts + 3.f;
+	return ImVec2(b.second.x + 4.f, b.first.y + row * step);
+}
+
+// ── RenderImpl ────────────────────────────────────────────────────────────────
+
+void Esp::RenderImpl() {
+	if (!cfg::enabled) return;
+
+	auto snap      = Cache::CopySnapshot();
+	auto& game     = snap.game;
+	auto& local    = snap.local;
+	auto& players  = snap.players;
+
+	ImGui::PushFont(this->font);
+	this->io  = ImGui::GetIO();
+	this->d   = ImGui::GetBackgroundDrawList();
+
+	// Read the view matrix fresh on this render frame so fast mouse movement
+	// doesn't cause ESP to lag behind the camera. The PA is already cached by
+	// the cache thread so this is just a single cheap IOCTL (no PA walk needed).
+	{
+		auto rp = Engine::GetProcess();
+		auto rc = Engine::GetClient();
+		if (rp) {
+			uintptr_t vmVa = offsets::resolvedViewMatrixVA
+			    ? offsets::resolvedViewMatrixVA
+			    : (rc.base + offsets::viewMatrix);
+			view_matrix_t freshVm{};
+			if (rp->read_raw_cached(vmVa, &freshVm, sizeof(freshVm))) {
+				float mag2 = freshVm.matrix[0][0]*freshVm.matrix[0][0]
+				           + freshVm.matrix[0][1]*freshVm.matrix[0][1]
+				           + freshVm.matrix[0][2]*freshVm.matrix[0][2];
+				if (mag2 > 0.1f)
+					game.view_matrix = freshVm;
+			}
+		}
+	}
+	this->matrix = game.view_matrix;
+
+	using clk = std::chrono::steady_clock;
+	auto now = clk::now();
+	float predDt = std::chrono::duration_cast<std::chrono::microseconds>(
+		now - snap.captured).count() * 1e-6f;
+	if (predDt < 0.f)  predDt = 0.f;
+	if (predDt > 0.02f) predDt = 0.02f;
+
+	{
+		static int s_espFrame = 0;
+		if (++s_espFrame % 300 == 1) {
+			int alive_cnt = 0;
+			for (auto& _p : players) if (_p.alive && !_p.localplayer) alive_cnt++;
+			printf("[ESP] local.team=%d players=%zu alive_not_local=%d\n",
+			       (int)local.team, players.size(), alive_cnt);
+		}
+	}
+
+	for (size_t i = 0; i < players.size(); ++i) {
+		const Player& raw = players[i];
+
+		if (!g_debugForceEspDraw) {
+			if (!raw.alive || raw.localplayer) continue;
+		}
+
+		// Only classify as teammate when our team is known; when team==0 (round
+		// transition / startup) treat everyone as enemy so ESP doesn't vanish.
+		const bool mate = (local.team != 0 && raw.team == local.team);
+
+		if (!g_debugForceEspDraw) {
+			if (!cfg::esp::team && mate)                    continue;
+			if (cfg::esp::spotted && !raw.spotted)          continue;
+			if (local.observer_services.target == raw.pawn_controller_addr
+				&& local.observer_services.mode == ObserverMode::First) continue;
+		}
+
+		Player pred = raw;
+		const float vx = raw.vel.x, vy = raw.vel.y, vz = raw.vel.z;
+		const float spd2 = vx*vx + vy*vy + vz*vz;
+		if (spd2 > 900.f) {
+			pred.pos.x += raw.vel.x * predDt;
+			pred.pos.y += raw.vel.y * predDt;
+			pred.pos.z += raw.vel.z * predDt;
+			for (size_t b = 0; b < pred.bone_list.size(); ++b) {
+				pred.bone_list[b].pos.x += raw.vel.x * predDt;
+				pred.bone_list[b].pos.y += raw.vel.y * predDt;
+				pred.bone_list[b].pos.z += raw.vel.z * predDt;
+			}
+		}
+
+		if (local.index >= 0 && local.index < 64)
+			pred.spotted = (raw.spotted_by_mask >> local.index) & 1u;
+
+		RenderPlayerTracers(local, pred, mate);
+		RenderPlayer(pred, mate);
+	}
+
+	RenderCrosshair(local);
+	ImGui::PopFont();
+}
+
+// ── per-player ────────────────────────────────────────────────────────────────
+
+void Esp::RenderPlayer(Player player, bool mate) {
+	if (!player.alive) return;
+
+	std::pair<Vec2_t, Vec2_t> bounds;
+	if (!player.GetBounds(matrix, io.DisplaySize, bounds)) return;
+
+	if (cfg::esp::box) {
+		const bool spotted = cfg::esp::spotted_color && player.spotted;
+		ImColor col = mate      ? cfg::esp::colors::box_team
+		            : spotted   ? cfg::esp::colors::box_spotted
+		                        : cfg::esp::colors::box_enemy;
+		d->AddRect(bounds.first, bounds.second, MakeCol(col),
+			0.f, 0, cfg::esp::box_thickness);
+	}
+
+	RenderPlayerBars(player, bounds);
+
+	if (cfg::esp::skeleton)     RenderPlayerBones(player, mate);
+	if (cfg::esp::head_tracker) RenderPlayerTracker(player, bounds, mate);
+
+	RenderPlayerFalgs(player, bounds, mate);
+}
+
+void Esp::RenderPlayerBones(Player player, bool mate) {
+	ImU32 col = MakeCol(mate ? cfg::esp::colors::skeleton_team
+	                         : cfg::esp::colors::skeleton_enemy);
+	const float thick = cfg::esp::skeleton_thickness;
+
+	for (size_t k = 0; k < std::size(connections); ++k) {
+		const int ai = connections[k][0], bi = connections[k][1];
+		const Vec3_t& pa = player.bone_list[ai].pos;
+		const Vec3_t& pb = player.bone_list[bi].pos;
+		if (!BoneValid(pa) || !BoneValid(pb)) continue;
+
+		Vec2_t sa, sb;
+		if (!matrix.wts(pa, io.DisplaySize, sa)) continue;
+		if (!matrix.wts(pb, io.DisplaySize, sb)) continue;
+		d->AddLine(sa, sb, col, thick);
+	}
+}
+
+void Esp::RenderPlayerTracker(Player player, std::pair<Vec2_t, Vec2_t> bounds, bool mate) {
+	const Vec3_t& hp = player.bone_list[bone_index::head].pos;
+	if (!BoneValid(hp)) return;
+
+	Vec2_t head;
+	if (!matrix.wts(hp, io.DisplaySize, head)) return;
+
+	const float radius = (bounds.second.x - bounds.first.x) * (1.f / 6.f);
+	ImU32 col = MakeCol(mate ? cfg::esp::colors::tracker_team
+	                         : cfg::esp::colors::tracker_enemy);
+	d->AddCircle(head, radius, col, 15);
+}
+
+// ── bars ─────────────────────────────────────────────────────────────────────
+
+void Esp::RenderPlayerBars(Player player, std::pair<Vec2_t, Vec2_t> bounds) {
+	// Health bar (left side, vertical)
+	if (cfg::esp::health) {
+		const float barL = bounds.first.x - 4.f;
+		const float barR = barL - 2.f;
+		const float top  = bounds.first.y;
+		const float bot  = bounds.second.y;
+		const float h    = bot - top;
+		const float fill = h * (player.health * 0.01f);
+
+		d->AddRectFilled(ImVec2(barL, bot - fill), ImVec2(barR, bot),
+			IM_COL32(100, 255, 100, 255));
+		d->AddRect(ImVec2(barL, top), ImVec2(barR, bot),
+			IM_COL32(0, 0, 0, 50));
+
+		if (cfg::esp::health_number) {
+			char buf[8]; snprintf(buf, sizeof(buf), "%d", player.health);
+			auto sz = font->CalcTextSizeA(cfg::esp::text_size, FLT_MAX, 0.f, buf);
+			float tx = (barL + barR) * 0.5f - sz.x * 0.5f;
+			float ty = bot - fill - sz.y * 0.5f;
+			d->AddText(font, cfg::esp::text_size, Vec2_t(tx, ty),
+				IM_COL32(255, 255, 255, 255), buf);
+		}
+	}
+
+	// Armor bar (bottom, horizontal)
+	if (cfg::esp::armor) {
+		const float left  = bounds.first.x;
+		const float right = bounds.second.x;
+		const float barT  = bounds.second.y + 4.f;
+		const float barB  = barT + 2.f;
+		const float w     = right - left;
+		const float fill  = w * (player.armor * 0.01f);
+
+		d->AddRectFilled(ImVec2(left, barT), ImVec2(left + fill, barB),
+			IM_COL32(150, 150, 255, 255));
+		d->AddRect(ImVec2(left, barT), ImVec2(right, barB),
+			IM_COL32(0, 0, 0, 50));
+	}
+}
+
+// ── flags ─────────────────────────────────────────────────────────────────────
+
+void Esp::RenderPlayerFalgs(Player player, std::pair<Vec2_t, Vec2_t> bounds, bool mate) {
+	const float ts  = cfg::esp::text_size;
+	const float step = ts + 3.f;
+	const ImU32 white = IM_COL32(255, 255, 255, 255);
+	const float cx = HalfX(bounds);
+
+	// Name — centered above box
+	if (cfg::esp::flags::name) {
+		char nbuf[40];
+		snprintf(nbuf, sizeof(nbuf), "%s%s", player.name,
+			player.bot ? skCrypt(" (Bot)") : "");
+		auto nsz = font->CalcTextSizeA(ts, FLT_MAX, 0.f, nbuf);
+		d->AddText(font, ts,
+			Vec2_t(cx - nsz.x * 0.5f, bounds.first.y - nsz.y - 4.f),
+			white, nbuf);
+	}
+
+	// Weapon — centered below box
+	if (cfg::esp::flags::weapon) {
+		const char* wname = player.weapon.name.data();
+		auto wsz = font->CalcTextSizeA(ts, FLT_MAX, 0.f, wname);
+		d->AddText(font, ts,
+			Vec2_t(cx - wsz.x * 0.5f, bounds.second.y + 4.f),
+			white, wname);
+	}
+
+	// Ammo — below weapon
+	if (cfg::esp::flags::ammo && player.ammo != -1) {
+		char abuf[8]; snprintf(abuf, sizeof(abuf), "%d", player.ammo);
+		auto asz = font->CalcTextSizeA(ts, FLT_MAX, 0.f, abuf);
+		d->AddText(font, ts,
+			Vec2_t(cx - asz.x * 0.5f, bounds.second.y + 4.f + step),
+			white, abuf);
+	}
+
+	// Right-side flags (money, ping, status tags)
+	int row = 0;
+	if (cfg::esp::flags::money && player.money) {
+		char mbuf[16]; snprintf(mbuf, sizeof(mbuf), "%d$", player.money);
+		d->AddText(font, ts, RightFlagPos(bounds, row++, ts), white, mbuf);
+	}
+	if (cfg::esp::flags::ping) {
+		char pbuf[12]; snprintf(pbuf, sizeof(pbuf), "%dms", player.ping);
+		d->AddText(font, ts, RightFlagPos(bounds, row++, ts), white, pbuf);
+	}
+	if (cfg::esp::flags::flashed && player.flashed) {
+		d->AddText(font, ts, RightFlagPos(bounds, row++, ts),
+			IM_COL32(100, 255, 100, 255), skCrypt("flashed"));
+	}
+	if (cfg::esp::flags::defusing && player.defusing) {
+		d->AddText(font, ts, RightFlagPos(bounds, row++, ts),
+			IM_COL32(255, 100, 100, 255), skCrypt("defusing"));
+	}
+	if (cfg::esp::flags::scoped && player.scoped) {
+		d->AddText(font, ts, RightFlagPos(bounds, row++, ts),
+			IM_COL32(100, 100, 255, 255), skCrypt("scoped"));
+	}
+	if (cfg::esp::flags::reloading && player.is_reloading) {
+		d->AddText(font, ts, RightFlagPos(bounds, row++, ts),
+			IM_COL32(200, 200, 100, 255), skCrypt("reloading"));
+	}
+	(void)row;
+}
+
+// ── crosshair ─────────────────────────────────────────────────────────────────
+
+void Esp::RenderCrosshair(Player local) {
+	if (!cfg::world::crosshair::enabled || local.scoped) return;
+
+	const float cx = floorf(io.DisplaySize.x * 0.5f);
+	const float cy = floorf(io.DisplaySize.y * 0.5f);
+	constexpr float kSz  = 6.f;
+	constexpr float kGap = 2.f;
+	constexpr float kW   = 1.5f;
+
+	struct Arm { float x0,y0,x1,y1; };
+	const Arm arms[4] = {
+		{ cx-kSz, cy,    cx-kGap, cy    },
+		{ cx+kGap,cy,    cx+kSz,  cy    },
+		{ cx,     cy-kSz,cx,     cy-kGap},
+		{ cx,     cy+kGap,cx,    cy+kSz },
+	};
+	for (const auto& a : arms) {
+		d->AddLine({a.x0,a.y0},{a.x1,a.y1}, IM_COL32(0,0,0,160), kW+1.f);
+		d->AddLine({a.x0,a.y0},{a.x1,a.y1}, IM_COL32(255,255,255,255), kW);
+	}
+}
+
+// ── tracers ───────────────────────────────────────────────────────────────────
+
+void Esp::RenderPlayerTracers(Player source, Player player, bool mate) {
+	if (!cfg::esp::tracers) return;
+
+	const float hw = io.DisplaySize.x * 0.5f;
+	const float hh = io.DisplaySize.y * 0.5f;
+
+	Vec2_t sp;
+	if (!matrix.wts(player.pos, io.DisplaySize, sp, false)) {
+		Vec3_t d3 = player.pos - source.pos;
+		float vx = matrix[0][0]*d3.x + matrix[0][1]*d3.y + matrix[0][2]*d3.z;
+		float vy = matrix[1][0]*d3.x + matrix[1][1]*d3.y + matrix[1][2]*d3.z;
+		float vz = matrix[2][0]*d3.x + matrix[2][1]*d3.y + matrix[2][2]*d3.z;
+
+		if (vz > 0.f) { vx = -vx; vy = -vy; }
+
+		float inv = 1.f / (sqrtf(vx*vx + vy*vy) + 1e-6f);
+		vx *= inv; vy *= inv;
+
+		constexpr float kMargin = 10.f;
+		sp.x = std::clamp(hw + vx * hw, kMargin, io.DisplaySize.x - kMargin);
+		sp.y = std::clamp(hh - vy * hh, kMargin, io.DisplaySize.y - kMargin);
+	}
+
+	ImU32 col = MakeCol(mate ? cfg::esp::colors::tracer_team
+	                         : cfg::esp::colors::tracer_enemy);
+	d->AddLine(Vec2_t(hw, hh), sp, col, 1.f);
+}
+

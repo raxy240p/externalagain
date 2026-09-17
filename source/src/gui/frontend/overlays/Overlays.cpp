@@ -1,0 +1,438 @@
+#include "Overlays.hpp"
+#include <skCrypter/skCrypter.hpp>
+
+#include "updater/Updater.hpp"
+#include "gui/renderer/Renderer.hpp" // Circular dependency
+#include "gui/frontend/menu/Menu.hpp" // Circular dependency
+
+bool Overlays::Init() {
+	return GetInstance().InitImpl();
+}
+
+void Overlays::Render() {
+    return GetInstance().RenderImpl();
+}
+
+bool Overlays::InitImpl() {
+	auto& io = ImGui::GetIO();
+
+	ImFontConfig cfg{};
+	cfg.FontDataOwnedByAtlas = false;
+
+	this->font_alt = io.Fonts->AddFontFromFileTTF(skCrypt("C:\\Windows\\Fonts\\arial.ttf"), 14.0f, &cfg);
+	this->font = io.Fonts->AddFontFromFileTTF(skCrypt("C:\\Windows\\Fonts\\consola.ttf"), 12.0f, &cfg);
+
+
+	// Pre allocate buffer
+	this->vel_buffer.resize(static_cast<size_t>(cfg::world::velocity::sample_rate * cfg::world::velocity::sample_length));
+
+	return true;
+}
+
+void Overlays::RenderImpl() {
+	ImGui::PushFont(this->font);
+	{
+		RenderWatermark();
+
+		RenderNotice();
+
+	#ifdef _DEBUG
+		RenderDebugWindow();
+	#endif
+
+	}
+	ImGui::PopFont();
+
+	ImGui::PushFont(this->font_alt);
+	{
+		RenderSpectatorList();
+		RenderSpeedChart();
+	}
+	ImGui::PopFont();
+}
+
+void Overlays::RenderWatermark() {
+	if (!cfg::settings::watermark)
+		return;
+
+	auto& io = ImGui::GetIO();
+	auto d = ImGui::GetBackgroundDrawList();
+
+	auto snapshot = Cache::CopySnapshot();
+	auto& globals = snapshot.globals;
+
+	static int margin = 10;
+	static int padding = 10;
+	std::string watermark_string = skCrypt("CS2 ESP");
+
+	watermark_string += std::format(" | {}fps", (int)io.Framerate);
+
+	if (globals.in_match)
+		watermark_string += std::format(" | {}", globals.map_name);
+
+	auto size = ImGui::CalcTextSize(watermark_string.data());
+
+	auto rect_start = ImVec2(io.DisplaySize.x - margin - padding * 2 - size.x, margin);
+	auto rect_end = ImVec2(io.DisplaySize.x - margin, margin + size.y + padding);
+	auto pos = ImVec2(rect_start.x + padding, rect_start.y + padding * 0.6/* compensate font */);
+
+	d->AddRectFilled(
+		rect_start,
+		rect_end,
+		IM_COL32(0, 0, 0, 200),
+		8.f
+	);
+
+	d->AddRect(
+		rect_start,
+		rect_end,
+		IM_COL32(100, 100, 100, 200),
+		8.f
+	);
+
+	d->AddText(
+		pos,
+		IM_COL32(255, 255, 255, 255),
+		watermark_string.data()
+	);
+}
+
+void Overlays::RenderNotice() {
+	static auto status = Updater::GetStatus();
+
+	if (status.notice.empty())
+		return;
+
+	if (!Renderer::IsOpen())
+		return;
+
+	auto& io = ImGui::GetIO();
+	auto d = ImGui::GetBackgroundDrawList();
+
+	static int margin = 10;
+	static int padding = 10;
+	auto menu_pos = Menu::GetPos();
+	auto menu_size = Menu::GetSize();
+
+	auto max_width = menu_size.x - padding * 2;
+	
+	auto size = ImGui::CalcTextSize(status.notice.data(), nullptr, false, max_width);
+
+	auto rect_start = ImVec2(menu_pos.x, menu_pos.y - margin - padding * 2 - size.y);
+	auto rect_end = ImVec2(menu_pos.x + menu_size.x, menu_pos.y - margin);
+	auto pos = ImVec2(rect_start.x + padding, rect_start.y + padding);
+
+	d->AddRectFilled(
+		rect_start,
+		rect_end,
+		IM_COL32(0, 0, 0, 200),
+		10.f
+	);
+
+	d->AddRect(
+		rect_start,
+		rect_end,
+		IM_COL32(100, 100, 100, 200),
+		10.f
+	);
+
+	d->AddText(
+		pos - ImVec2(0, padding + padding * 0.5),
+		IM_COL32(255, 200, 0, 255),
+		skCrypt("Notice")
+	);
+
+	d->AddText(
+		this->font,
+		this->font->LegacySize,
+		pos,
+		IM_COL32(255, 255, 255, 255),
+		status.notice.data(),
+		nullptr, 
+		max_width
+	);
+}
+
+inline Player* FindPlayerByPawnIndex(std::vector<Player>& players, int index) {
+	Player* found = nullptr;
+
+	for (auto& p : players) {
+		if (p.pawn_controller_addr == index) {
+			found = &p;
+			break;
+		}
+	}
+	return found;
+}
+
+void Overlays::RenderSpectatorList() {
+	if (!cfg::world::spectators::enabled)
+		return;
+
+	auto snapshot = Cache::CopySnapshot();
+	auto& players = snapshot.players;
+
+	const bool is_menu_open = Renderer::IsOpen();
+	const bool detailed = cfg::world::spectators::detailed;
+	const bool self_only = cfg::world::spectators::self_only;
+
+	ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize;
+	ImGuiTableFlags flags_table = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_BordersOuterH | ImGuiTableFlags_BordersV;
+
+	bool should_render = false;
+	for (Player& p : players) {
+		if (p.alive) continue;
+		auto mode = p.observer_services.mode;
+		if (mode != ObserverMode::First && mode != ObserverMode::Third && mode != ObserverMode::Free)
+			continue;
+		if (auto i = p.observer_services.target) {
+			Player* target = FindPlayerByPawnIndex(players, i);
+
+			if (self_only && (!target || !target->localplayer))
+				continue;
+
+			should_render = true;
+			break;
+		}
+	}
+
+	if (!should_render && !is_menu_open)
+		return;
+
+	// Window
+	ImGui::SetNextWindowPos(cfg::world::spectators::pos, ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSizeConstraints(ImVec2(150.f, 50.f), ImVec2(FLT_MAX, FLT_MAX));
+
+	if (!ImGui::Begin(skCrypt("Spectator list"), nullptr, flags)) {
+		ImGui::End();
+		return;
+	}
+
+	if (is_menu_open)
+		cfg::world::spectators::pos = ImGui::GetWindowPos();
+
+	if (!should_render && is_menu_open) {
+		ImGui::TextDisabled(skCrypt("No spectators"));
+		return ImGui::End();
+	}
+
+	if (detailed) {
+		if (ImGui::BeginTable("##detailed", 3, flags_table)) {
+			ImGui::TableSetupColumn("Name");
+			ImGui::TableSetupColumn("Mode");
+			ImGui::TableSetupColumn("Target");
+			ImGui::TableHeadersRow();
+
+			for (Player& player : players) {
+				if (player.alive) continue;
+
+				auto mode = player.observer_services.mode;
+				if (mode != ObserverMode::First && mode != ObserverMode::Third && mode != ObserverMode::Free)
+					continue;
+
+				int targetIndex = player.observer_services.target;
+				if (targetIndex == 0) continue;
+
+				Player* target = FindPlayerByPawnIndex(players, targetIndex);
+
+				if (self_only && (!target || !target->localplayer))
+					continue;
+
+				ImGui::TableNextRow();
+				ImGui::TableSetColumnIndex(0);
+				ImGui::Text("%s", player.name);
+
+				ImGui::TableSetColumnIndex(1);
+				ImGui::Text("%s", player.observer_services.ToString());
+
+				ImGui::TableSetColumnIndex(2);
+				if (self_only) ImGui::Text("You");
+				else if (player.observer_services.mode == ObserverMode::Free) ImGui::Text("No One");
+				else ImGui::Text("%s", target ? target->name : "Invalid/bomb");
+			}
+
+			ImGui::EndTable();
+		}
+	}
+	else {
+		for (Player& player : players) {
+			if (player.alive) continue;
+			auto mode = player.observer_services.mode;
+			if (mode != ObserverMode::First && mode != ObserverMode::Third && mode != ObserverMode::Free)
+				continue;
+			int targetIndex = player.observer_services.target;
+			if (targetIndex == 0) continue;
+			Player* target = FindPlayerByPawnIndex(players, targetIndex);
+
+			if (self_only && (!target || !target->localplayer)) continue;
+
+			ImGui::Text("%s", player.name);
+		}
+	}
+
+	ImGui::End();
+}
+
+void Overlays::RenderSpeedChart() {
+	if (!cfg::world::velocity::enabled)
+		return;
+
+	auto& io = ImGui::GetIO();
+	auto d = ImGui::GetBackgroundDrawList();
+
+	auto snapshot = Cache::CopySnapshot();
+	auto& local = snapshot.local;
+	auto& globals = snapshot.globals;
+
+	const static float padding = 10.0f;
+	const bool is_menu_open = Renderer::IsOpen();
+
+	auto& pos = cfg::world::velocity::pos;
+	auto& size = cfg::world::velocity::size;
+
+	int rate = cfg::world::velocity::sample_rate;
+	float length = cfg::world::velocity::sample_length;
+
+	static int prev_rate = rate;
+	static float prev_length = length;
+
+	float left = pos.x + padding;
+	float right = pos.x + size.x - padding;
+	float bottom = pos.y + size.y - padding;
+	float top = pos.y + padding;
+
+	float width = right - left;
+	float height = bottom - top;
+
+	if (!is_menu_open && !globals.in_match)
+		return;
+
+	if (is_menu_open) {
+		auto height_padding = 25; // some padding to keep the speed number inside the area
+		auto altitude_padding = 10; // so it doesnt go under the titlebar
+
+		ImGui::SetNextWindowBgAlpha(0.1f);
+		ImGui::SetNextWindowPos(pos - Vec2_t(0, altitude_padding), ImGuiCond_Once);
+		ImGui::SetNextWindowSize(size + Vec2_t(0, height_padding), ImGuiCond_Once);
+		if (ImGui::Begin(skCrypt("Velocity Graph"), nullptr, ImGuiWindowFlags_NoCollapse))
+		{
+			pos = ImGui::GetWindowPos() + ImVec2(0, altitude_padding);
+			size = ImGui::GetWindowSize() - ImVec2(0, height_padding);
+			ImGui::End();
+		}
+	}
+
+	// Cache menu values and resize when changed
+	if (prev_rate != rate || prev_length != length) {
+		prev_rate = rate;
+		prev_length = length;
+
+		vel_buffer.resize(static_cast<size_t>(rate * length));
+	}
+
+	Vec2_t speed_2d(local.vel.x, local.vel.y);
+	int speed = floor(speed_2d.len());
+
+	vel_accumulator += io.DeltaTime;
+	size_t buff_size = vel_buffer.size();
+	if (buff_size < 2) return;
+
+	std::vector<ImVec2> points;
+	points.reserve(buff_size);
+
+	float sample_interval = 1.0f / rate;
+
+	while (vel_accumulator >= sample_interval)
+	{
+		vel_accumulator -= sample_interval;
+		vel_buffer.at(vel_index % buff_size) = speed;
+		vel_index = (vel_index + 1) % buff_size;
+	}
+
+	int max_speed = 1;
+	for (int v : vel_buffer)
+		max_speed = std::max(max_speed, v);
+
+	for (size_t i = 0; i < buff_size; ++i) {
+		float t = i / float(buff_size - 1);
+
+		float x = left + t * width;
+
+		float normalized =
+			vel_buffer[(i + vel_index) % buff_size] / float(max_speed);
+
+		float y = bottom - (normalized * height);
+
+		points.emplace_back(x, y);
+	}
+
+	d->AddPolyline(
+		points.data(),
+		static_cast<int>(points.size()),
+		IM_COL32(255, 255, 255, 255),
+		ImDrawFlags_None,
+		1.0f
+	);
+
+	auto center = ImVec2(
+		pos.x + size.x / 2,
+		pos.y + size.y
+	);
+
+	d->AddText(
+		center,
+		IM_COL32(255, 255, 255, 255),
+		std::to_string(speed).c_str());
+}
+
+#ifdef _DEBUG
+void Overlays::RenderDebugWindow() {
+	auto& io = ImGui::GetIO();
+	auto d = ImGui::GetBackgroundDrawList();
+
+	auto snapshot = Cache::CopySnapshot();
+	auto& game = snapshot.game;
+	auto& globals = snapshot.globals;
+	auto& players = snapshot.players;
+
+	static int margin = 10;
+	static int padding = 10;
+	std::string debug_string = "> Game Debug Window\n";
+
+	debug_string += std::format("Map: {}\n", globals.map_name);
+	debug_string += std::format("Max Clients: {}\n", globals.max_clients);
+	debug_string += std::format("Cache Refresh: {}ms\n", cfg::dev::cache_refresh_rate);
+
+	if (!players.empty())
+		debug_string += std::format("Players ({}):\n", players.size());
+
+	for (auto& player : players)
+		debug_string += std::format(
+			"- [{}] {} {}hp {}\n", 
+			player.index, player.name, 
+			player.health, player.weapon.name
+		);
+
+	auto size = ImGui::CalcTextSize(debug_string.data());
+
+	d->AddRectFilled(
+		ImVec2(10 + margin - padding, io.DisplaySize.y - size.y - 20 - margin - padding),
+		ImVec2(10 + size.x + margin + padding, io.DisplaySize.y - 20 - margin + padding),
+		IM_COL32(0, 0, 0, 200),
+		10.f
+	);
+
+	d->AddRect(
+		ImVec2(10 + margin - padding, io.DisplaySize.y - size.y - 20 - margin - padding),
+		ImVec2(10 + size.x + margin + padding, io.DisplaySize.y - 20 - margin + padding),
+		IM_COL32(100, 100, 100, 200),
+		10.f
+	);
+
+	d->AddText(
+		ImVec2(10 + margin, io.DisplaySize.y - size.y - 20 - margin),
+		IM_COL32(255, 255, 255, 255),
+		debug_string.data()
+	);
+}
+#endif
