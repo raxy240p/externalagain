@@ -82,10 +82,46 @@ static bool IsProcessRunning(const char* exeName) {
 
 static bool IsDriverLoaded() {
     HANDLE h = CreateFileA("\\\\.\\Nal",
-        GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, 0, nullptr);
     bool ok = (h != INVALID_HANDLE_VALUE);
     if (ok) CloseHandle(h);
     return ok;
+}
+
+// Fast sanity check: the file at drvPath must exist, start with MZ,
+// and be a plausible driver size. Catches a mis-copied file before
+// SCM turns "bad content" into a useless err=577/1275.
+static bool ValidateDriverFile(const char* drvPath) {
+    HANDLE h = CreateFileA(drvPath, GENERIC_READ, FILE_SHARE_READ,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart < 0x1000 || sz.QuadPart > 0x2000000) {
+        CloseHandle(h); return false;
+    }
+    uint16_t mz = 0;
+    DWORD got = 0;
+    bool ok = ReadFile(h, &mz, sizeof(mz), &got, nullptr) && got == sizeof(mz) && mz == 0x5A4D;
+    CloseHandle(h);
+    return ok;
+}
+
+// Turn opaque Win32 codes into a one-line hint. Kept as static text —
+// no dynamic lookup, no leaked format strings from resource DLLs.
+static const char* DecodeStartErr(DWORD err) {
+    switch (err) {
+        case 5:    return "access denied — not elevated, or another handle holds the sys";
+        case 32:   return "sharing violation — the sys file is in use, close and retry";
+        case 87:   return "invalid parameter — CreateService args rejected";
+        case 577:  return "ERROR_INVALID_IMAGE_HASH — driver blocklist rejected the signature";
+        case 1275: return "ERROR_DRIVER_BLOCKED — blocklist / code integrity refused load";
+        case 1058: return "service disabled";
+        case 1073: return "service already exists under a different config";
+        case 1450: return "no system resources (file may be delete-pending, wait and retry)";
+        default:   return "";
+    }
 }
 
 static bool StartDriver() {
@@ -156,13 +192,23 @@ static bool StartDriver() {
         pCloseServiceHandle(hSCM);
         return false;
     }
+    if (!ValidateDriverFile(drvPath)) {
+        std::cout << "[!] Driver file at " << drvPath << " is not a valid PE image.\n";
+        std::cout << "    Re-copy iqvw64e.sys to that path.\n";
+        pCloseServiceHandle(hSCM);
+        return false;
+    }
 
     SC_HANDLE hSvc = pCreateServiceA(hSCM, svcName, svcName,
         SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER,
         SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
         drvPath, nullptr, nullptr, nullptr, nullptr, nullptr);
     if (!hSvc) {
-        std::cout << "[!] CreateService failed (err=" << pGetLastError() << ")\n";
+        DWORD e = pGetLastError();
+        const char* hint = DecodeStartErr(e);
+        std::cout << "[!] CreateService failed (err=" << e << ")";
+        if (*hint) std::cout << " — " << hint;
+        std::cout << "\n";
         pCloseServiceHandle(hSCM);
         return false;
     }
@@ -172,7 +218,16 @@ static bool StartDriver() {
     bool  ok     = started || err == ERROR_SERVICE_ALREADY_RUNNING;
 
     if (!ok) {
-        std::cout << "[!] StartService failed (err=" << err << ")\n";
+        const char* hint = DecodeStartErr(err);
+        std::cout << "[!] StartService failed (err=" << err << ")";
+        if (*hint) std::cout << " — " << hint;
+        std::cout << "\n";
+        if (err == 577 || err == 1275) {
+            std::cout << "    Driver blocklist rejected iqvw64e. Options:\n"
+                         "      - HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Config"
+                         " → VulnerableDriverBlocklistEnable = 0, reboot\n"
+                         "      - Or use a Windows build/SKU without the blocklist\n";
+        }
         pDeleteService(hSvc);
         DeleteFileA(drvPath);
     }
