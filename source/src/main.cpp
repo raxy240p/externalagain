@@ -253,7 +253,8 @@ static bool StartDriver() {
                          "      - Or use a Windows build/SKU without the blocklist\n";
         }
         pDeleteService(hSvc);
-        DeleteFileA(drvPath);
+        // Leave the .sys file on disk so the user can diagnose (blocklist,
+        // wrong version, etc.) without re-copying before each retry.
     }
 
     pCloseServiceHandle(hSvc);
@@ -299,7 +300,11 @@ static void StopDriver() {
         pCloseServiceHandle(hSvc);
     }
     pCloseServiceHandle(hSCM);
-    DeleteFileA(GetDriverPath());
+    // Keep the driver file on disk between runs — the machine-stable filename
+    // acts as a persistent one-shot cache. Deleting it forces the user to
+    // re-copy iqvw64e.sys before every launch. If you want strict clean-up
+    // on exit for stealth, uncomment the DeleteFileA call below.
+    // DeleteFileA(GetDriverPath());
 }
 
 static bool IsElevated() {
