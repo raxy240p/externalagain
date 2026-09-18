@@ -7,9 +7,11 @@ uint32_t pProcess::FindProcessIdByProcessName(const char* ProcessName) {
     std::wstring wideName(ProcessName, ProcessName + strlen(ProcessName));
     using PFN_Snap  = HANDLE(WINAPI*)(DWORD, DWORD);
     using PFN_ProcW = BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32W);
+    using PFN_Close = BOOL(WINAPI*)(HANDLE);
     static auto pfSnap  = (PFN_Snap) li::detail::resolve(0x185776B5u);
     static auto pfFirst = (PFN_ProcW)li::detail::resolve(0x0E81B808u);
     static auto pfNext  = (PFN_ProcW)li::detail::resolve(0xABE5123Fu);
+    static auto pfClose = (PFN_Close)li::detail::resolve(li::fnv1a("CloseHandle"));
     HANDLE snapshot = pfSnap(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) return 0;
     PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
@@ -22,7 +24,7 @@ uint32_t pProcess::FindProcessIdByProcessName(const char* ProcessName) {
             }
         } while (pfNext(snapshot, &pe));
     }
-    CloseHandle(snapshot);
+    pfClose(snapshot);
     return pid;
 }
 
@@ -40,17 +42,23 @@ uint32_t pProcess::FindProcessIdByWindowName(const char* WindowName) {
 HWND pProcess::GetWindowHandleFromProcessId(DWORD ProcessId) {
     using FFWE = HWND(WINAPI*)(HWND, HWND, LPCSTR, LPCSTR);
     using FGWTPID = DWORD(WINAPI*)(HWND, LPDWORD);
-    auto pFindWindowEx = reinterpret_cast<FFWE>(AntiDebug::ResolveExport(AntiDebug::Fnv1a("FindWindowEx")));
+    using FGWT = int(WINAPI*)(HWND, LPSTR, int);
+    using FIWV = BOOL(WINAPI*)(HWND);
+    auto pFindWindowEx = reinterpret_cast<FFWE>(AntiDebug::ResolveExport(AntiDebug::Fnv1a("FindWindowExA")));
     auto pGetWindowThreadProcessId = reinterpret_cast<FGWTPID>(AntiDebug::ResolveExport(AntiDebug::Fnv1a("GetWindowThreadProcessId")));
+    auto pGetWindowTextA = reinterpret_cast<FGWT>(AntiDebug::ResolveExport(AntiDebug::Fnv1a("GetWindowTextA")));
+    auto pIsWindowVisible = reinterpret_cast<FIWV>(AntiDebug::ResolveExport(AntiDebug::Fnv1a("IsWindowVisible")));
+    if (!pFindWindowEx || !pGetWindowThreadProcessId || !pGetWindowTextA || !pIsWindowVisible)
+        return nullptr;
     HWND hwnd = nullptr;
     do {
         hwnd = pFindWindowEx(nullptr, hwnd, nullptr, nullptr);
         DWORD pid = 0;
         pGetWindowThreadProcessId(hwnd, &pid);
         if (pid == ProcessId) {
-            TCHAR title[MAX_PATH];
-            GetWindowText(hwnd, title, MAX_PATH);
-            if (IsWindowVisible(hwnd) && title[0]) return hwnd;
+            char title[MAX_PATH];
+            pGetWindowTextA(hwnd, title, MAX_PATH);
+            if (pIsWindowVisible(hwnd) && title[0]) return hwnd;
         }
     } while (hwnd);
     return nullptr;
@@ -59,7 +67,6 @@ HWND pProcess::GetWindowHandleFromProcessId(DWORD ProcessId) {
 bool pProcess::AttachProcess(const char* ProcessName) {
     pid_ = FindProcessIdByProcessName(ProcessName);
     if (!pid_) return false;
-    handle_ = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid_);
     hwnd_ = GetWindowHandleFromProcessId(pid_);
     return true;
 }
@@ -78,19 +85,8 @@ bool pProcess::UpdateHWND() {
 
 
 LPVOID pProcess::Allocate(size_t size_in_bytes) {
-    if (!pid_) return nullptr;
-    using FVAE = LPVOID(WINAPI*)(HANDLE, LPVOID, SIZE_T, DWORD, DWORD);
-    auto pVirtualAllocEx = reinterpret_cast<FVAE>(AntiDebug::ResolveExport(AntiDebug::Fnv1a("VirtualAllocEx")));
-    if (!pVirtualAllocEx) return nullptr;
-    if (handle_) {
-        LPVOID r = pVirtualAllocEx(handle_, nullptr, size_in_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (r) return r;
-    }
-    HANDLE tmp = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE, FALSE, pid_);
-    if (!tmp) return nullptr;
-    LPVOID r = pVirtualAllocEx(tmp, nullptr, size_in_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    CloseHandle(tmp);
-    return r;
+    (void)size_in_bytes;
+    return nullptr;
 }
 
 uintptr_t pProcess::FindSignature(std::vector<uint8_t> signature) {
