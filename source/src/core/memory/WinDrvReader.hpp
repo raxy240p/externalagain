@@ -68,6 +68,7 @@ public:
         return instance;
     }
 
+
     bool Open() {
         if (IsOpen()) return true;
         DBG_PRINT("[nal] Opening device...\n");
@@ -677,27 +678,40 @@ public:
     }
 
     uint64_t VirtualToPhysical(uint64_t cr3, uint64_t va) {
+        if (!IsSafeToMap(cr3)) return 0;
+
         // PML4 index
         uint64_t pml4e = ReadPhys64(cr3 + ((va >> 39) & 0x1FF) * 8);
         if (!(pml4e & 1)) return 0;
+        uint64_t pdptPA = pml4e & 0xFFFFFFFFFF000ULL;
+        if (!IsSafeToMap(pdptPA)) return 0;
 
         // PDPT index
-        uint64_t pdpte = ReadPhys64((pml4e & 0xFFFFFFFFFF000) + ((va >> 30) & 0x1FF) * 8);
+        uint64_t pdpte = ReadPhys64(pdptPA + ((va >> 30) & 0x1FF) * 8);
         if (!(pdpte & 1)) return 0;
-        if (pdpte & 0x80) // 1GB page
-            return (pdpte & 0xFFFFFC0000000000) | (va & 0x3FFFFFFF);
+        if (pdpte & 0x80) { // 1GB page
+            uint64_t pa = (pdpte & 0xFFFFFC0000000000ULL) | (va & 0x3FFFFFFFULL);
+            return IsSafeToMap(pa) ? pa : 0;
+        }
+        uint64_t pdPA = pdpte & 0xFFFFFFFFFF000ULL;
+        if (!IsSafeToMap(pdPA)) return 0;
 
         // PD index
-        uint64_t pde = ReadPhys64((pdpte & 0xFFFFFFFFFF000) + ((va >> 21) & 0x1FF) * 8);
+        uint64_t pde = ReadPhys64(pdPA + ((va >> 21) & 0x1FF) * 8);
         if (!(pde & 1)) return 0;
-        if (pde & 0x80) // 2MB page
-            return (pde & 0xFFFFFFFE00000) | (va & 0x1FFFFF);
+        if (pde & 0x80) { // 2MB page
+            uint64_t pa = (pde & 0xFFFFFFFE00000ULL) | (va & 0x1FFFFFULL);
+            return IsSafeToMap(pa) ? pa : 0;
+        }
+        uint64_t ptPA = pde & 0xFFFFFFFFFF000ULL;
+        if (!IsSafeToMap(ptPA)) return 0;
 
         // PT index
-        uint64_t pte = ReadPhys64((pde & 0xFFFFFFFFFF000) + ((va >> 12) & 0x1FF) * 8);
+        uint64_t pte = ReadPhys64(ptPA + ((va >> 12) & 0x1FF) * 8);
         if (!(pte & 1)) return 0;
 
-        return (pte & 0xFFFFFFFFFF000) | (va & 0xFFF);
+        uint64_t pa = (pte & 0xFFFFFFFFFF000ULL) | (va & 0xFFFULL);
+        return IsSafeToMap(pa) ? pa : 0;
     }
 
     bool ReadVirtual(uint64_t cr3, uint64_t va, void* buffer, size_t size) {
@@ -727,12 +741,18 @@ public:
 
     bool PhysRead(uint64_t physAddr, void* buffer, size_t size) {
         if (!size) return true;
+        // Hard guard: never let a bad PA reach the driver's MmMapIoSpace.
+        // IsSafeToMap uses actual system RAM size + MMIO/ISA blocklist,
+        // so this rejects any PA that could bugcheck 0x1A.
+        if (!IsSafeToMap(physAddr) || !IsSafeToMap(physAddr + size - 1))
+            return false;
         uint8_t* dst = (uint8_t*)buffer;
         size_t done = 0;
         while (done < size) {
             uint64_t pagePA = (physAddr + done) & ~0xFFFULL;
             uint64_t offset = (physAddr + done) - pagePA;
             size_t   chunk  = (std::min)(size - done, (size_t)(0x1000 - offset));
+            if (!IsSafeToMap(pagePA)) return false;
 
             EnterCriticalSection(&m_physLock);
             bool hit = false;
