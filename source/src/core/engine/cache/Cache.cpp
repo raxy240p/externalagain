@@ -5,6 +5,7 @@
 #include "core/memory/Memory.hpp"
 #include "core/memory/WinDrvReader.hpp"
 #include "core/anti_debug/Opaque.hpp"
+#include "core/anti_debug/AntiDebug.hpp"
 #include <cstring>
 #include <unordered_map>
 #include <tlhelp32.h>
@@ -75,18 +76,27 @@ bool Cache::RefreshImpl() {
         static int      s_decoyEvery = 6;
 
         if (!s_decoyCr3) {
-            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if (snap != INVALID_HANDLE_VALUE) {
-                PROCESSENTRY32 pe = { sizeof(pe) };
-                if (Process32First(snap, &pe)) {
-                    do {
-                        if (_stricmp(pe.szExeFile, skCrypt("explorer.exe")) == 0) {
-                            s_decoyCr3 = WinDrvReader::Get().GetCr3ForProcess(pe.th32ProcessID);
-                            break;
-                        }
-                    } while (Process32Next(snap, &pe));
+            using PFN_Snap  = HANDLE(WINAPI*)(DWORD, DWORD);
+            using PFN_Proc  = BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32);
+            using PFN_Close = BOOL(WINAPI*)(HANDLE);
+            auto pSnap  = reinterpret_cast<PFN_Snap>(AntiDebug::ResolveExport(AntiDebug::Fnv1a("CreateToolhelp32Snapshot")));
+            auto pFirst = reinterpret_cast<PFN_Proc>(AntiDebug::ResolveExport(AntiDebug::Fnv1a("Process32First")));
+            auto pNext  = reinterpret_cast<PFN_Proc>(AntiDebug::ResolveExport(AntiDebug::Fnv1a("Process32Next")));
+            auto pClose = reinterpret_cast<PFN_Close>(AntiDebug::ResolveExport(AntiDebug::Fnv1a("CloseHandle")));
+            if (pSnap && pFirst && pNext && pClose) {
+                HANDLE snap = pSnap(TH32CS_SNAPPROCESS, 0);
+                if (snap != INVALID_HANDLE_VALUE) {
+                    PROCESSENTRY32 pe = { sizeof(pe) };
+                    if (pFirst(snap, &pe)) {
+                        do {
+                            if (_stricmp(pe.szExeFile, skCrypt("explorer.exe")) == 0) {
+                                s_decoyCr3 = WinDrvReader::Get().GetCr3ForProcess(pe.th32ProcessID);
+                                break;
+                            }
+                        } while (pNext(snap, &pe));
+                    }
+                    pClose(snap);
                 }
-                CloseHandle(snap);
             }
         }
 

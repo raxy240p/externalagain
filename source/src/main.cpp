@@ -81,12 +81,15 @@ static bool IsProcessRunning(const char* exeName) {
 }
 
 static bool IsDriverLoaded() {
-    HANDLE h = CreateFileA("\\\\.\\Nal",
+    auto pCreateFileA = RESOLVE(CreateFileA);
+    auto pCloseHandle = RESOLVE(CloseHandle);
+    if (!pCreateFileA || !pCloseHandle) return false;
+    HANDLE h = pCreateFileA(skCrypt("\\\\.\\Nal"),
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, 0, nullptr);
     bool ok = (h != INVALID_HANDLE_VALUE);
-    if (ok) CloseHandle(h);
+    if (ok) pCloseHandle(h);
     return ok;
 }
 
@@ -94,17 +97,22 @@ static bool IsDriverLoaded() {
 // and be a plausible driver size. Catches a mis-copied file before
 // SCM turns "bad content" into a useless err=577/1275.
 static bool ValidateDriverFile(const char* drvPath) {
-    HANDLE h = CreateFileA(drvPath, GENERIC_READ, FILE_SHARE_READ,
+    auto pCreateFileA  = RESOLVE(CreateFileA);
+    auto pCloseHandle  = RESOLVE(CloseHandle);
+    auto pGetFileSizeEx = RESOLVE(GetFileSizeEx);
+    auto pReadFile     = RESOLVE(ReadFile);
+    if (!pCreateFileA || !pCloseHandle || !pGetFileSizeEx || !pReadFile) return false;
+    HANDLE h = pCreateFileA(drvPath, GENERIC_READ, FILE_SHARE_READ,
                            nullptr, OPEN_EXISTING, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER sz{};
-    if (!GetFileSizeEx(h, &sz) || sz.QuadPart < 0x1000 || sz.QuadPart > 0x2000000) {
-        CloseHandle(h); return false;
+    if (!pGetFileSizeEx(h, &sz) || sz.QuadPart < 0x1000 || sz.QuadPart > 0x2000000) {
+        pCloseHandle(h); return false;
     }
     uint16_t mz = 0;
     DWORD got = 0;
-    bool ok = ReadFile(h, &mz, sizeof(mz), &got, nullptr) && got == sizeof(mz) && mz == 0x5A4D;
-    CloseHandle(h);
+    bool ok = pReadFile(h, &mz, sizeof(mz), &got, nullptr) && got == sizeof(mz) && mz == 0x5A4D;
+    pCloseHandle(h);
     return ok;
 }
 
@@ -297,7 +305,7 @@ static bool IsElevated() {
 
 int main()
 {
-    SetConsoleTitleA("CS2 External ESP");
+    SetConsoleTitleA(skCrypt("CS2 External ESP"));
     {
         HANDLE _h = GetStdHandle(STD_OUTPUT_HANDLE);
         DWORD  _m = 0;
@@ -315,7 +323,7 @@ int main()
     c_exception_handler::setup();
 
     std::cout << "\033[2J\033[H\n";
-    std::cout << "  \033[94mCS2 External ESP\033[0m\n";
+    std::cout << skCrypt("  \033[94mCS2 External ESP\033[0m\n");
     std::cout << "  \033[34m------------------------------------------\033[0m\n\n";
 
     AntiDebug::Assert();
@@ -333,7 +341,7 @@ int main()
         goto exit;
     }
 
-    std::cout << "  \033[96m[*]\033[0m Waiting for driver and CS2...\n\n";
+    std::cout << skCrypt("  \033[96m[*]\033[0m Waiting for driver and CS2...\n\n");
     {
         bool drvReady  = false, cs2Ready = false;
         int  waitedMs  = 0;
@@ -342,7 +350,7 @@ int main()
 
         while (!drvReady || !cs2Ready) {
             drvReady = IsDriverLoaded();
-            cs2Ready = IsProcessRunning("cs2.exe");
+            cs2Ready = IsProcessRunning(skCrypt("cs2.exe"));
 
             std::cout
                 << "\r    \033[90m" << sp[spinIdx++ % 4] << "\033[0m  "
