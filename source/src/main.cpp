@@ -135,6 +135,16 @@ static const char* DecodeStartErr(DWORD err) {
 static bool StartDriver() {
     if (IsDriverLoaded()) return true;
 
+    // SCM APIs live in advapi32.dll. It's not necessarily loaded yet at this
+    // point (static CRT + no direct advapi32 references), so ResolveExport
+    // would return nullptr and the first call would crash silently.
+    // Force-load it once, then resolve.
+    {
+        using LLA_fn = HMODULE(WINAPI*)(LPCSTR);
+        auto pLoadLibraryA = reinterpret_cast<LLA_fn>(AntiDebug::ResolveExport(AntiDebug::Fnv1a("LoadLibraryA")));
+        if (pLoadLibraryA) pLoadLibraryA(skCrypt("advapi32.dll"));
+    }
+
     auto pOpenSCManagerA     = RESOLVE(OpenSCManagerA);
     auto pOpenServiceA       = RESOLVE(OpenServiceA);
     auto pCreateServiceA     = RESOLVE(CreateServiceA);
@@ -144,6 +154,12 @@ static bool StartDriver() {
     auto pControlService     = RESOLVE(ControlService);
     auto pQueryServiceStatus = RESOLVE(QueryServiceStatus);
     auto pGetLastError       = RESOLVE(GetLastError);
+
+    if (!pOpenSCManagerA || !pOpenServiceA || !pCreateServiceA ||
+        !pDeleteService || !pStartServiceA || !pCloseServiceHandle) {
+        std::cout << "[!] SCM API resolution failed (advapi32 not loaded?)\n";
+        return false;
+    }
 
     const char* svcName = GetSvcName();
     const char* drvPath = GetDriverPath();
