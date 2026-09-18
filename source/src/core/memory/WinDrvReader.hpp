@@ -819,6 +819,24 @@ private:
         // clearly-bogus low address risks bugcheck 0x3B.
         if (!out || reinterpret_cast<uintptr_t>(out) < 0x10000ULL) return false;
 
+        // Windows 11 24H2/25H2 populates MmMapIoSpace mappings lazily; the
+        // driver's memcpy loop walks the user destination's PT via kernel
+        // self-map addressing to translate it. If the destination page is
+        // paged out at that instant, the walk hits a non-present PTE and
+        // faults inside the driver → bugcheck 0x3B. VirtualLock keeps the
+        // page(s) resident for the duration of the IOCTL.
+        {
+            using VLock_fn = BOOL(WINAPI*)(LPVOID, SIZE_T);
+            static auto pVirtualLock = reinterpret_cast<VLock_fn>(
+                AntiDebug::ResolveExport(AntiDebug::Fnv1a("VirtualLock")));
+            if (pVirtualLock) pVirtualLock(out, 4096);
+        }
+
+        // PA blacklist: if a PA fails or was involved in a driver-side
+        // fault before, skip it. Small ring so lookups stay O(1).
+        for (int i = 0; i < kBadPaCount; i++)
+            if (m_badPAs[i] && m_badPAs[i] == pagePA) return false;
+
         // Serialise the whole map/memcpy/unmap sequence. Concurrent threads
         // running the sequence on different PAs can race the driver's
         // internal mapping state; one caller finishing unmap while another
@@ -885,6 +903,11 @@ private:
                 printf(skCrypt("[SysMonitor] Nal memcpy failed: err=%lu (PA=0x%llX, kva=0x%llX)\n"),
                        GetLastError(), (unsigned long long)pagePA, (unsigned long long)kva);
             }
+            // Blacklist this PA — the mapping "succeeded" but the memcpy
+            // through it failed, which means the underlying page is not
+            // reliably readable. Trying again risks a kernel-side fault.
+            m_badPAs[m_badPaHead] = pagePA;
+            m_badPaHead = (m_badPaHead + 1) % kBadPaCount;
         }
 
         // Step 3: MmUnmapIoSpace(kva, 4096) -- always attempt, even if memcpy failed.
@@ -1230,4 +1253,10 @@ private:
     // never have overlapping mappings active in the driver. Prevents a
     // whole class of kernel-side races that can bugcheck 0x3B.
     CRITICAL_SECTION m_ioctlLock;
+    // Small ring of PAs the driver has failed on. Later attempts to read
+    // these are refused up-front. Prevents the same PA re-hammering the
+    // driver after it just faulted on it.
+    static constexpr int kBadPaCount = 64;
+    uint64_t             m_badPAs[kBadPaCount] = {};
+    int                  m_badPaHead = 0;
 };
