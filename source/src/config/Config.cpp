@@ -1,7 +1,7 @@
 #include "Config.hpp"
-#include "loader/skCrypt.hpp"
+#include <skCrypter/skCrypter.hpp>
 
-#define CFG_PATH (skCrypt("config.json").decrypt())
+#define CFG_PATH (skCrypt("config.json"))
 
 bool Config::Read() {
 	return GetInstance().ReadImpl();
