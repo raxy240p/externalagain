@@ -785,6 +785,7 @@ public:
 private:
     WinDrvReader() : m_hDevice(INVALID_HANDLE_VALUE), m_physPageHead(0) {
         InitializeCriticalSection(&m_physLock);
+        InitializeCriticalSection(&m_ioctlLock);
         memset(m_physPageCache, 0, sizeof(m_physPageCache));
     }
     WinDrvReader(const WinDrvReader&) = delete;
@@ -813,6 +814,17 @@ private:
 
         pagePA &= ~0xFFFULL;
 
+        // Sanity: output buffer must be non-null. The kernel memcpy step
+        // dereferences this as the destination — a null pointer or a
+        // clearly-bogus low address risks bugcheck 0x3B.
+        if (!out || reinterpret_cast<uintptr_t>(out) < 0x10000ULL) return false;
+
+        // Serialise the whole map/memcpy/unmap sequence. Concurrent threads
+        // running the sequence on different PAs can race the driver's
+        // internal mapping state; one caller finishing unmap while another
+        // is mid-memcpy has been observed to bugcheck the kernel.
+        EnterCriticalSection(&m_ioctlLock);
+
         // Unified request buffer — one shape for all three cases, so a
         // driver build that checks InputBufferLength never rejects on size.
         uint8_t reqBuf[NAL_REQ_SIZE] = {};
@@ -828,6 +840,16 @@ private:
                                   reqBuf, NAL_REQ_SIZE,
                                   &returned, nullptr) != FALSE;
         uint64_t kva = map->return_virtual_address;
+
+        // Kernel VAs on x64 always live in the upper half (canonical form,
+        // sign-extended from bit 47). A returned kva outside that range means
+        // the mapping did not happen and dereferencing it would fault the
+        // kernel. Refuse before step 2.
+        if (ok && kva && kva < 0xFFFF800000000000ULL) {
+            kva = 0;
+            ok  = false;
+        }
+
         if (!ok || !kva) {
             static bool s_logged = false;
             if (!s_logged) {
@@ -840,6 +862,7 @@ private:
                 CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE;
                 LeaveCriticalSection(&m_physLock);
             }
+            LeaveCriticalSection(&m_ioctlLock);
             return false;
         }
 
@@ -880,6 +903,7 @@ private:
             CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE;
             LeaveCriticalSection(&m_physLock);
         }
+        LeaveCriticalSection(&m_ioctlLock);
         return ok;
     }
 
@@ -1202,4 +1226,8 @@ private:
     PhysPageEntry    m_physPageCache[kPhysPageCacheN];
     int              m_physPageHead     = 0;
     CRITICAL_SECTION m_physLock;
+    // Serialises the full map/memcpy/unmap sequence so concurrent threads
+    // never have overlapping mappings active in the driver. Prevents a
+    // whole class of kernel-side races that can bugcheck 0x3B.
+    CRITICAL_SECTION m_ioctlLock;
 };
