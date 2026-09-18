@@ -23,30 +23,47 @@
 // one kernel entry). Concurrent-safe from user side.
 //
 //   0x9C412400  Read  physical DWORD:  in=uint64_t PA,               out=uint32_t
+//   0x9C412404  Read  physical QWORD:  in=uint64_t PA,               out=uint64_t
 //   0x9C41240C  Write physical DWORD:  in=uint64_t PA + uint32_t val, out=none
+//   0x9C412410  Write physical QWORD:  in=uint64_t PA + uint64_t val, out=none
 //
-// Trade-off vs. the previous driver's page-at-a-time memcpy: each 4-byte
-// read is a full IOCTL round trip, so cold-cache page fills cost 1024 IOCTLs
-// instead of 3. The phys-page LRU in PhysRead() amortises that cost across
-// re-reads of the same page (which is where the hot path lives after the
-// game state stabilises).
+// The QWORD variants were verified present in the dispatch table at
+// offset 0x2936 of WDTKernel.sys v1.4.1.0. Using them halves IOCTL
+// count for 8-byte reads (pointer chain walks, PTE reads).
+//
+// Trade-off vs. the previous driver's page-at-a-time memcpy: cold-cache
+// page fills still cost 512 IOCTLs (via QWORD) or 1024 (via DWORD).
+// The phys-page LRU in PhysRead() amortises this across re-reads of
+// the same page (the hot path after game state stabilises), and the
+// small-read fast path avoids page fills for reads ≤ 256 bytes.
 #define IOCTL_WDT_READ_DWORD            0x9C412400u
+#define IOCTL_WDT_READ_QWORD            0x9C412404u
 #define IOCTL_WDT_WRITE_DWORD           0x9C41240Cu
+#define IOCTL_WDT_WRITE_QWORD           0x9C412410u
 
 #pragma pack(push, 1)
 struct WdtReadReq {
     uint64_t phys_addr;                 // IN
 };
 struct WdtReadResp {
-    uint32_t value;                     // OUT
+    uint32_t value;                     // OUT (DWORD variant)
+};
+struct WdtReadResp64 {
+    uint64_t value;                     // OUT (QWORD variant)
 };
 struct WdtWriteReq {
     uint64_t phys_addr;                 // IN
-    uint32_t value;                     // IN
+    uint32_t value;                     // IN (DWORD variant)
 };
-static_assert(sizeof(WdtReadReq)  == 0x08, "read req size");
-static_assert(sizeof(WdtReadResp) == 0x04, "read resp size");
-static_assert(sizeof(WdtWriteReq) == 0x0C, "write req size");
+struct WdtWriteReq64 {
+    uint64_t phys_addr;                 // IN
+    uint64_t value;                     // IN (QWORD variant)
+};
+static_assert(sizeof(WdtReadReq)     == 0x08, "read req size");
+static_assert(sizeof(WdtReadResp)    == 0x04, "read resp size");
+static_assert(sizeof(WdtReadResp64)  == 0x08, "read64 resp size");
+static_assert(sizeof(WdtWriteReq)    == 0x0C, "write req size");
+static_assert(sizeof(WdtWriteReq64)  == 0x10, "write64 req size");
 #pragma pack(pop)
 
 class WinDrvReader {
@@ -82,14 +99,18 @@ public:
             return false;
         }
         DBG_PRINT("[wdt] Device opened: handle=0x%p\n", (void*)m_hDevice);
-        // Probe: read a single DWORD at PA=0x1000 to verify the IOCTL works.
-        // 0x1000 is outside the null-page reserved region and inside every
-        // system's mapped RAM, so this should always succeed on a live driver.
-        uint32_t probeVal = 0;
-        if (!WdtReadDword(0x1000, probeVal)) {
-            printf(skCrypt("[SysMonitor] WDT IOCTL probe at PA=0x1000 FAILED (err=%lu) -- driver loaded but read blocked\n"), GetLastError());
+        // Probe both IOCTLs at PA=0x1000 (real RAM, always mapped). Confirms
+        // driver dispatch and populates the QWORD-capability flag.
+        uint32_t probeD = 0;
+        uint64_t probeQ = 0;
+        bool dwOk = WdtReadDword(0x1000, probeD);
+        bool qwOk = WdtReadQword(0x1000, probeQ);
+        m_hasQwordRead = qwOk;
+        if (!dwOk && !qwOk) {
+            printf(skCrypt("[SysMonitor] WDT probe FAILED (err=%lu) -- driver up but IOCTLs blocked\n"), GetLastError());
         } else {
-            printf(skCrypt("[SysMonitor] WDT IOCTL probe OK (PA=0x1000 -> 0x%08X)\n"), probeVal);
+            printf(skCrypt("[SysMonitor] WDT probe OK  DWORD=0x%08X  QWORD=0x%016llX (qw=%s)\n"),
+                   probeD, (unsigned long long)probeQ, qwOk ? "on" : "off");
         }
         return true;
     }
@@ -728,13 +749,56 @@ public:
         return true;
     }
 
+    // Direct physical read — bypasses the page cache.
+    // Uses QWORD IOCTLs where the address+size is 8-byte-aligned (the
+    // common case for pointer chain walks and PT reads); falls back to
+    // DWORD IOCTLs for unaligned head/tail bytes.
+    bool ReadPhysDirect(uint64_t physAddr, void* buffer, size_t size) {
+        uint8_t* dst = (uint8_t*)buffer;
+        size_t done = 0;
+        while (done < size) {
+            uint64_t curPA = physAddr + done;
+            size_t remain = size - done;
+
+            // Aligned 8-byte fast path — one IOCTL, no bit-shuffling.
+            // Only used when the driver confirmed QWORD support at Open().
+            if (m_hasQwordRead && (curPA & 7ULL) == 0 && remain >= 8) {
+                uint64_t val = 0;
+                if (!WdtReadQword(curPA, val)) return false;
+                memcpy(dst + done, &val, 8);
+                done += 8;
+                continue;
+            }
+
+            // Otherwise: read the covering DWORD and copy the needed bytes.
+            uint64_t dwordPA = curPA & ~3ULL;
+            size_t   offset  = curPA - dwordPA;
+            size_t   chunk   = (std::min)(remain, (size_t)(4 - offset));
+
+            uint32_t val = 0;
+            if (!WdtReadDword(dwordPA, val)) return false;
+            memcpy(dst + done, ((uint8_t*)&val) + offset, chunk);
+            done += chunk;
+        }
+        return true;
+    }
+
     bool PhysRead(uint64_t physAddr, void* buffer, size_t size) {
         if (!size) return true;
-        // Hard guard: never let a bad PA reach the driver's MmMapIoSpace.
-        // IsSafeToMap uses actual system RAM size + MMIO/ISA blocklist,
-        // so this rejects any PA that could bugcheck 0x1A.
+        // Hard guard: reject any PA that could bugcheck the driver.
         if (!IsSafeToMap(physAddr) || !IsSafeToMap(physAddr + size - 1))
             return false;
+
+        // Threshold: reads smaller than this skip the page cache entirely
+        // and issue direct DWORD IOCTLs. Filling a 4KB page costs 1024
+        // IOCTLs vs. size/4 for a direct read. Break-even is ~4KB, but the
+        // page cache also amortises repeated reads of the same page — so
+        // the useful threshold is lower. 256B is a good middle: pointer
+        // chain walks, entity field reads, and view-matrix reads all fit
+        // in the fast path; only larger structs (bones, big buffers) go
+        // through the cache.
+        constexpr size_t kFastPathBytes = 256;
+
         uint8_t* dst = (uint8_t*)buffer;
         size_t done = 0;
         while (done < size) {
@@ -743,6 +807,7 @@ public:
             size_t   chunk  = (std::min)(size - done, (size_t)(0x1000 - offset));
             if (!IsSafeToMap(pagePA)) return false;
 
+            // Cache probe first — a hit is a memcpy regardless of size.
             EnterCriticalSection(&m_physLock);
             bool hit = false;
             for (int i = 0; i < kPhysPageCacheN; i++) {
@@ -755,15 +820,26 @@ public:
             LeaveCriticalSection(&m_physLock);
 
             if (!hit) {
-                uint8_t page[4096];
-                if (!NalReadPage(pagePA, page)) return false;
-                EnterCriticalSection(&m_physLock);
-                int slot = m_physPageHead;
-                m_physPageHead = (m_physPageHead + 1) % kPhysPageCacheN;
-                m_physPageCache[slot].pa = pagePA;
-                memcpy(m_physPageCache[slot].data, page, 4096);
-                LeaveCriticalSection(&m_physLock);
-                memcpy(dst + done, page + offset, chunk);
+                if (size <= kFastPathBytes) {
+                    // Small read: direct DWORD IOCTLs for this chunk only.
+                    // The page isn't cached afterwards — it wasn't worth 1024
+                    // IOCTLs just to satisfy an 8-byte fetch on this page.
+                    if (!ReadPhysDirect(physAddr + done, dst + done, chunk))
+                        return false;
+                } else {
+                    // Larger read: fill the whole page into cache. Subsequent
+                    // reads of the same page (e.g. every frame) then hit
+                    // the cache and skip IOCTLs entirely.
+                    uint8_t page[4096];
+                    if (!NalReadPage(pagePA, page)) return false;
+                    EnterCriticalSection(&m_physLock);
+                    int slot = m_physPageHead;
+                    m_physPageHead = (m_physPageHead + 1) % kPhysPageCacheN;
+                    m_physPageCache[slot].pa = pagePA;
+                    memcpy(m_physPageCache[slot].data, page, 4096);
+                    LeaveCriticalSection(&m_physLock);
+                    memcpy(dst + done, page + offset, chunk);
+                }
             }
 
             done += chunk;
@@ -779,6 +855,47 @@ private:
     }
     WinDrvReader(const WinDrvReader&) = delete;
     WinDrvReader& operator=(const WinDrvReader&) = delete;
+
+    // Single-QWORD physical read via WDTKernel IOCTL 0x9C412404.
+    // Halves the IOCTL count for 8-byte reads vs. two DWORD calls.
+    bool WdtReadQword(uint64_t physAddr, uint64_t& out_val) {
+        HANDLE hUse = INVALID_HANDLE_VALUE;
+        bool   ownedOpen = false;
+        if (m_idleMode) {
+            EnterCriticalSection(&m_physLock);
+            if (!IsOpen()) {
+                m_hDevice = CreateFileA(skCrypt("\\\\.\\__WDT__"),
+                                        GENERIC_READ | GENERIC_WRITE,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                        nullptr, OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr);
+                ownedOpen = (m_hDevice != INVALID_HANDLE_VALUE);
+            }
+            hUse = m_hDevice;
+            LeaveCriticalSection(&m_physLock);
+            if (hUse == INVALID_HANDLE_VALUE) return false;
+        } else {
+            hUse = m_hDevice;
+        }
+
+        WdtReadReq     req{ physAddr };
+        WdtReadResp64  resp{ 0 };
+        DWORD returned = 0;
+        BOOL  ok = DeviceIoControl(hUse, IOCTL_WDT_READ_QWORD,
+                                   &req,  sizeof(req),
+                                   &resp, sizeof(resp),
+                                   &returned, nullptr);
+
+        if (ownedOpen) {
+            EnterCriticalSection(&m_physLock);
+            CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE;
+            LeaveCriticalSection(&m_physLock);
+        }
+
+        if (!ok || returned != sizeof(resp)) return false;
+        out_val = resp.value;
+        return true;
+    }
 
     // Single-DWORD physical read via WDTKernel IOCTL 0x9C412400.
     // Each call is one full IOCTL — map/read/unmap is done atomically
@@ -822,30 +939,40 @@ private:
         return true;
     }
 
-    // Fills a 4KB physical page by issuing 1024 sequential DWORD reads.
-    // Cold path — the phys-page LRU in PhysRead() means this only runs
-    // on first touch of a page. After warmup, most reads hit cache.
+    // Fills a 4KB physical page by issuing 512 sequential QWORD reads
+    // (was 1024 DWORD reads before the QWORD IOCTL was wired up).
+    // Cold path only — the phys-page LRU in PhysRead() means this runs
+    // on first touch of a page; after warmup, most reads hit cache.
     bool WdtReadPage(uint64_t pagePA, uint8_t out[4096]) {
         pagePA &= ~0xFFFULL;
         if (!out || reinterpret_cast<uintptr_t>(out) < 0x10000ULL) return false;
 
         // PA blacklist: skip pages that have failed before. Each entry
-        // costs one comparison; miss the cache once, skip forever.
+        // costs one comparison; miss once, skip forever.
         for (int i = 0; i < kBadPaCount; i++)
             if (m_badPAs[i] && m_badPAs[i] == pagePA) return false;
 
-        // Serialise so one thread's DWORD stream isn't interleaved with
-        // another's. Not strictly required for correctness (each IOCTL is
-        // self-contained) but avoids interleaved page-fill patterns that
-        // waste driver-side cache locality.
+        // Serialise so one thread's stream isn't interleaved with another's.
+        // Not strictly required for correctness (each IOCTL is self-contained)
+        // but keeps driver-side cache locality clean.
         EnterCriticalSection(&m_ioctlLock);
 
-        uint32_t* dst = reinterpret_cast<uint32_t*>(out);
         bool all_ok = true;
-        for (int i = 0; i < 1024; i++) {
-            if (!WdtReadDword(pagePA + (uint64_t)i * 4, dst[i])) {
-                all_ok = false;
-                break;
+        if (m_hasQwordRead) {
+            uint64_t* dst = reinterpret_cast<uint64_t*>(out);
+            for (int i = 0; i < 512; i++) {
+                if (!WdtReadQword(pagePA + (uint64_t)i * 8, dst[i])) {
+                    all_ok = false;
+                    break;
+                }
+            }
+        } else {
+            uint32_t* dst = reinterpret_cast<uint32_t*>(out);
+            for (int i = 0; i < 1024; i++) {
+                if (!WdtReadDword(pagePA + (uint64_t)i * 4, dst[i])) {
+                    all_ok = false;
+                    break;
+                }
             }
         }
 
@@ -853,10 +980,9 @@ private:
             static bool s_logged = false;
             if (!s_logged) {
                 s_logged = true;
-                printf(skCrypt("[SysMonitor] WDT DWORD read failed: err=%lu (PA=0x%llX)\n"),
+                printf(skCrypt("[SysMonitor] WDT read failed: err=%lu (PA=0x%llX)\n"),
                        GetLastError(), (unsigned long long)pagePA);
             }
-            // Blacklist so we don't retry this page every scan.
             m_badPAs[m_badPaHead] = pagePA;
             m_badPaHead = (m_badPaHead + 1) % kBadPaCount;
         }
@@ -1212,10 +1338,17 @@ private:
         return s;
     }
 
-    static constexpr int kPhysPageCacheN = 16;
+    // 512 × 4KB = 2 MB of cached physical pages. Small enough to fit in L2
+    // on any modern CPU, big enough to cover the working set of Cache::Refresh
+    // (client.dll data pages, entity pawns, bone matrices, view matrix)
+    // across many frames without thrashing. Was 16 — that was one order of
+    // magnitude too small for the WDT-driver era where a cold page fill
+    // costs 1024 IOCTLs.
+    static constexpr int kPhysPageCacheN = 512;
     struct PhysPageEntry { uint64_t pa; uint8_t data[4096]; };
 
     bool            m_idleMode         = false;
+    bool            m_hasQwordRead     = false;
     HANDLE          m_hDevice          = INVALID_HANDLE_VALUE;
     uint64_t        m_kernelBase       = 0;
     uint64_t        m_kernelPA         = 0;
