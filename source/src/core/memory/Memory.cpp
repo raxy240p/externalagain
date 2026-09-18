@@ -59,6 +59,7 @@ HWND pProcess::GetWindowHandleFromProcessId(DWORD ProcessId) {
 bool pProcess::AttachProcess(const char* ProcessName) {
     pid_ = FindProcessIdByProcessName(ProcessName);
     if (!pid_) return false;
+    handle_ = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid_);
     hwnd_ = GetWindowHandleFromProcessId(pid_);
     return true;
 }

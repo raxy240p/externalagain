@@ -1,10 +1,6 @@
 #ifndef _PPROCESS_HPP_
 #define _PPROCESS_HPP_
-#ifdef NDEBUG
-#define DBG_PRINT(...) ((void)0)
-#else
-#define DBG_PRINT(...) printf(__VA_ARGS__)
-#endif
+#include "core/debug.hpp"
 
 #include <vector>
 #include <Windows.h>
@@ -26,6 +22,8 @@ public:
     HANDLE   handle_ = nullptr;
     HWND     hwnd_   = nullptr;
     ProcessModule base_client_{};
+
+    ~pProcess() { Close(); }
 
     bool AttachProcess(const char* process_name);
     bool AttachWindow(const char* window_name);

@@ -1,0 +1,16 @@
+x64/
+Debug/
+Release/
+.vs/
+*.obj
+*.pdb
+*.exe
+*.log
+*.user
+*.suo
+*.ncb
+*.sdf
+*.opensdf
+ipch/
+*.aps
+esp_debug.txt
