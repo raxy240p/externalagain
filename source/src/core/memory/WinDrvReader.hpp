@@ -1,9 +1,5 @@
 #pragma once
-#ifdef NDEBUG
-#define DBG_PRINT(...) ((void)0)
-#else
-#define DBG_PRINT(...) DBG_PRINT(__VA_ARGS__)
-#endif
+#include "core/debug.hpp"
 #include <windows.h>
 #include <psapi.h>
 #include <tlhelp32.h>
@@ -1132,12 +1128,17 @@ private:
         uint32_t VadRoot;
     };
 
+    // Verified builds: 19041–19045 (Win10 20H1–22H2), 22000–22631 (Win11 21H2–23H2), 26100+ (Win11 24H2+)
     static const EprocessLayout& Layout() {
         static const EprocessLayout s = [] {
             using RtlGV_t = LONG(NTAPI*)(RTL_OSVERSIONINFOW*);
             auto pRtlGetVersion = (RtlGV_t)AntiDebug::ResolveExport(AntiDebug::Fnv1a("RtlGetVersion"));
             RTL_OSVERSIONINFOW vi = { sizeof(vi) };
             DWORD build = (pRtlGetVersion && pRtlGetVersion(&vi) == 0) ? vi.dwBuildNumber : 0;
+
+            if (build > 0 && build < 19041) {
+                printf("[SysMonitor] WARNING: untested Windows build %lu — EPROCESS offsets may be wrong\n", (unsigned long)build);
+            }
 
             EprocessLayout l = {};
             if (build >= 26100) {

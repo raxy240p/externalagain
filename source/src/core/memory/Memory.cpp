@@ -59,6 +59,7 @@ HWND pProcess::GetWindowHandleFromProcessId(DWORD ProcessId) {
 bool pProcess::AttachProcess(const char* ProcessName) {
     pid_ = FindProcessIdByProcessName(ProcessName);
     if (!pid_) return false;
+    handle_ = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid_);
     hwnd_ = GetWindowHandleFromProcessId(pid_);
     return true;
 }
@@ -77,9 +78,19 @@ bool pProcess::UpdateHWND() {
 
 
 LPVOID pProcess::Allocate(size_t size_in_bytes) {
+    if (!pid_) return nullptr;
     using FVAE = LPVOID(WINAPI*)(HANDLE, LPVOID, SIZE_T, DWORD, DWORD);
     auto pVirtualAllocEx = reinterpret_cast<FVAE>(AntiDebug::ResolveExport(AntiDebug::Fnv1a("VirtualAllocEx")));
-    return pVirtualAllocEx(handle_, nullptr, size_in_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pVirtualAllocEx) return nullptr;
+    if (handle_) {
+        LPVOID r = pVirtualAllocEx(handle_, nullptr, size_in_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (r) return r;
+    }
+    HANDLE tmp = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE, FALSE, pid_);
+    if (!tmp) return nullptr;
+    LPVOID r = pVirtualAllocEx(tmp, nullptr, size_in_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    CloseHandle(tmp);
+    return r;
 }
 
 uintptr_t pProcess::FindSignature(std::vector<uint8_t> signature) {
