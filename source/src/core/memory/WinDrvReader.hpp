@@ -105,13 +105,30 @@ public:
         uint64_t probeQ = 0;
         bool dwOk = WdtReadDword(0x1000, probeD);
         bool qwOk = WdtReadQword(0x1000, probeQ);
+
+        // Consistency check: if both IOCTLs claim success, their low 32
+        // bits must match (same physical DWORD). If they don't, the
+        // "QWORD" IOCTL actually does something else on this driver
+        // build — treat it as unsupported to avoid corrupt reads.
+        if (dwOk && qwOk && (uint32_t)probeQ != probeD) {
+            printf(skCrypt("[SysMonitor] WDT QWORD mismatch: DWORD=0x%08X  QWORD-low=0x%08X — QWORD disabled\n"),
+                   probeD, (uint32_t)probeQ);
+            qwOk = false;
+        }
         m_hasQwordRead = qwOk;
+
         if (!dwOk && !qwOk) {
             printf(skCrypt("[SysMonitor] WDT probe FAILED (err=%lu) -- driver up but IOCTLs blocked\n"), GetLastError());
-        } else {
-            printf(skCrypt("[SysMonitor] WDT probe OK  DWORD=0x%08X  QWORD=0x%016llX (qw=%s)\n"),
-                   probeD, (unsigned long long)probeQ, qwOk ? "on" : "off");
+            // Fail Open() so Engine::Init doesn't proceed with a driver
+            // whose read path is broken. Previously we returned true here
+            // and downstream code cascaded through failed CR3 resolution,
+            // module discovery, etc., with no clear diagnostic.
+            CloseHandle(m_hDevice);
+            m_hDevice = INVALID_HANDLE_VALUE;
+            return false;
         }
+        printf(skCrypt("[SysMonitor] WDT probe OK  DWORD=0x%08X  QWORD=0x%016llX (qw=%s)\n"),
+               probeD, (unsigned long long)probeQ, qwOk ? "on" : "off");
         return true;
     }
 
@@ -1306,7 +1323,14 @@ private:
             RTL_OSVERSIONINFOW vi = { sizeof(vi) };
             DWORD build = (pRtlGetVersion && pRtlGetVersion(&vi) == 0) ? vi.dwBuildNumber : 0;
 
-            if (build > 0 && build < 19041) {
+            if (build == 0) {
+                // RtlGetVersion resolution failed. Default to the newest
+                // known layout — target box is Win11 24H2/25H2, wrong
+                // Win10 offsets there would silently misread every EPROCESS
+                // field and cause a cascade of module-discovery failures.
+                printf("[SysMonitor] WARNING: RtlGetVersion failed — assuming Win11 24H2+ EPROCESS layout\n");
+                build = 26100;
+            } else if (build < 19041) {
                 printf("[SysMonitor] WARNING: untested Windows build %lu — EPROCESS offsets may be wrong\n", (unsigned long)build);
             }
 
