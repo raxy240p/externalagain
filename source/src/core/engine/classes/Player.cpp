@@ -1,10 +1,5 @@
 #include "Player.hpp"
-
-#ifdef NDEBUG
-#define DBG_PRINT(...) ((void)0)
-#else
-#define DBG_PRINT(...) DBG_PRINT(__VA_ARGS__)
-#endif
+#include "core/debug.hpp"
 
 #include <chrono>
 using steady_clock = std::chrono::steady_clock;

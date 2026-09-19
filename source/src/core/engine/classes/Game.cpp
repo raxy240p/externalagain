@@ -1,10 +1,5 @@
 #include "Game.hpp"
-
-#ifdef NDEBUG
-#define DBG_PRINT(...) ((void)0)
-#else
-#define DBG_PRINT(...) DBG_PRINT(__VA_ARGS__)
-#endif
+#include "core/debug.hpp"
 
 #include <vector>
 #include <chrono>
