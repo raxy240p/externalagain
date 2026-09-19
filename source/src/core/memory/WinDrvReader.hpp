@@ -12,52 +12,58 @@
 #include <lazy_importer/lazy_importer.hpp>
 #include "core/anti_debug/AntiDebug.hpp"
 
-// iqvw64e.sys (Intel Network Adapter Diagnostic Driver, WHQL-signed).
-// Single IOCTL 0x80862007 dispatched by an in-struct case_number:
-//   0x19  MmMapIoSpace(phys, size)   -> returns kernel VA of the mapping
-//   0x33  memcpy(dst, src, length)   -> arbitrary VAs, executed in kernel context
-//   0x1A  MmUnmapIoSpace(va, size)   -> releases the mapping
-// PhysRead is: map page -> memcpy(kernelVA -> user buffer) -> unmap.
-// The phys-page LRU in PhysRead() absorbs the 3x IOCTL cost per uncached page.
-#define IOCTL_NAL                       0x80862007u
-#define NAL_CASE_MAP_IO_SPACE           0x19u
-#define NAL_CASE_MEMCPY                 0x33u
-#define NAL_CASE_UNMAP_IO_SPACE         0x1Au
+// WDTKernel.sys (Dell Watchdog Timer Kernel Driver v1.4.1.0, WHQL-signed).
+// SHA256: 0E27BEC347CA0050C455467BD8D774175C503B8AA1AF3411E94966F7DC6B28B7
+// Not on Microsoft's HVCI vulnerable-driver blocklist as of Win11 24H2/25H2.
+//
+// Device: \\.\__WDT__
+//
+// IOCTL scheme — direct physical-memory access, no MmMapIoSpace state
+// leaks across calls (each IOCTL maps, reads/writes, and unmaps within
+// one kernel entry). Concurrent-safe from user side.
+//
+//   0x9C412400  Read  physical DWORD:  in=uint64_t PA,               out=uint32_t
+//   0x9C412404  Read  physical QWORD:  in=uint64_t PA,               out=uint64_t
+//   0x9C41240C  Write physical DWORD:  in=uint64_t PA + uint32_t val, out=none
+//   0x9C412410  Write physical QWORD:  in=uint64_t PA + uint64_t val, out=none
+//
+// The QWORD variants were verified present in the dispatch table at
+// offset 0x2936 of WDTKernel.sys v1.4.1.0. Using them halves IOCTL
+// count for 8-byte reads (pointer chain walks, PTE reads).
+//
+// Trade-off vs. the previous driver's page-at-a-time memcpy: cold-cache
+// page fills still cost 512 IOCTLs (via QWORD) or 1024 (via DWORD).
+// The phys-page LRU in PhysRead() amortises this across re-reads of
+// the same page (the hot path after game state stabilises), and the
+// small-read fast path avoids page fills for reads ≤ 256 bytes.
+#define IOCTL_WDT_READ_DWORD            0x9C412400u
+#define IOCTL_WDT_READ_QWORD            0x9C412404u
+#define IOCTL_WDT_WRITE_DWORD           0x9C41240Cu
+#define IOCTL_WDT_WRITE_QWORD           0x9C412410u
 
-// One request buffer for all three cases. Sized to the largest known
-// Nal struct (Unmap = 0x30). Some driver builds refuse the IOCTL when
-// InputBufferLength < the union footprint; a fixed-size buffer avoids
-// per-case size gating and keeps one DeviceIoControl call shape.
 #pragma pack(push, 1)
-struct NalMapIoSpace {
-    uint64_t case_number;               // +0x00 = 0x19
-    uint64_t reserved;                  // +0x08
-    uint64_t return_value;              // +0x10 OUT: NTSTATUS-ish
-    uint64_t return_virtual_address;    // +0x18 OUT: mapped kernel VA
-    uint64_t physical_address_to_map;   // +0x20 IN
-    uint32_t size;                      // +0x28 IN
-    uint32_t pad;                       // +0x2C
+struct WdtReadReq {
+    uint64_t phys_addr;                 // IN
 };
-struct NalMemCopy {
-    uint64_t case_number;               // +0x00 = 0x33
-    uint64_t reserved;                  // +0x08
-    uint64_t source;                    // +0x10 IN
-    uint64_t destination;               // +0x18 IN
-    uint64_t length;                    // +0x20 IN
-    uint64_t pad;                       // +0x28
+struct WdtReadResp {
+    uint32_t value;                     // OUT (DWORD variant)
 };
-struct NalUnmapIoSpace {
-    uint64_t case_number;               // +0x00 = 0x1A
-    uint64_t reserved1;                 // +0x08
-    uint64_t reserved2;                 // +0x10
-    uint64_t virt_address;              // +0x18 IN
-    uint64_t reserved3;                 // +0x20
-    uint64_t number_of_bytes;           // +0x28 IN
+struct WdtReadResp64 {
+    uint64_t value;                     // OUT (QWORD variant)
 };
-static_assert(sizeof(NalMapIoSpace)   == 0x30, "map struct size");
-static_assert(sizeof(NalMemCopy)      == 0x30, "copy struct size");
-static_assert(sizeof(NalUnmapIoSpace) == 0x30, "unmap struct size");
-#define NAL_REQ_SIZE 0x30u
+struct WdtWriteReq {
+    uint64_t phys_addr;                 // IN
+    uint32_t value;                     // IN (DWORD variant)
+};
+struct WdtWriteReq64 {
+    uint64_t phys_addr;                 // IN
+    uint64_t value;                     // IN (QWORD variant)
+};
+static_assert(sizeof(WdtReadReq)     == 0x08, "read req size");
+static_assert(sizeof(WdtReadResp)    == 0x04, "read resp size");
+static_assert(sizeof(WdtReadResp64)  == 0x08, "read64 resp size");
+static_assert(sizeof(WdtWriteReq)    == 0x0C, "write req size");
+static_assert(sizeof(WdtWriteReq64)  == 0x10, "write64 req size");
 #pragma pack(pop)
 
 class WinDrvReader {
@@ -71,12 +77,12 @@ public:
 
     bool Open() {
         if (IsOpen()) return true;
-        DBG_PRINT("[nal] Opening device...\n");
+        DBG_PRINT("[wdt] Opening device...\n");
         // Symlink race: StartService returns before I/O manager publishes
-        // \DosDevices\Nal on some builds. Retry briefly on ERROR_FILE_NOT_FOUND.
+        // \DosDevices\__WDT__ on some builds. Retry briefly on ERROR_FILE_NOT_FOUND.
         DWORD lastErr = 0;
         for (int attempt = 0; attempt < 10; attempt++) {
-            m_hDevice = CreateFileA(skCrypt("\\\\.\\Nal"),
+            m_hDevice = CreateFileA(skCrypt("\\\\.\\__WDT__"),
                                     GENERIC_READ | GENERIC_WRITE,
                                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                                     nullptr, OPEN_EXISTING,
@@ -87,21 +93,42 @@ public:
             Sleep(100);
         }
         if (m_hDevice == INVALID_HANDLE_VALUE) {
-            DBG_PRINT("[nal] Failed to open device: err=%lu\n", lastErr);
-            if (lastErr == 2) DBG_PRINT("[nal]   (device not found -- driver not loaded)\n");
-            else if (lastErr == 5) DBG_PRINT("[nal]   (access denied -- need admin or handle already held)\n");
+            DBG_PRINT("[wdt] Failed to open device: err=%lu\n", lastErr);
+            if (lastErr == 2) DBG_PRINT("[wdt]   (device not found -- driver not loaded)\n");
+            else if (lastErr == 5) DBG_PRINT("[wdt]   (access denied -- need admin or handle already held)\n");
             return false;
         }
-        DBG_PRINT("[nal] Device opened: handle=0x%p\n", (void*)m_hDevice);
-        // Probe: try reading physical page 0x1000 to verify IOCTL chain actually works
-        uint8_t probe[4096];
-        if (!NalReadPage(0x1000, probe)) {
-            printf(skCrypt("[SysMonitor] Nal IOCTL probe at PA=0x1000 FAILED (err=%lu) -- driver loaded but map/copy blocked\n"), GetLastError());
-        } else {
-            printf(skCrypt("[SysMonitor] Nal IOCTL probe OK (first 8 bytes: %02X %02X %02X %02X %02X %02X %02X %02X)\n"),
-                probe[0], probe[1], probe[2], probe[3],
-                probe[4], probe[5], probe[6], probe[7]);
+        DBG_PRINT("[wdt] Device opened: handle=0x%p\n", (void*)m_hDevice);
+        // Probe both IOCTLs at PA=0x1000 (real RAM, always mapped). Confirms
+        // driver dispatch and populates the QWORD-capability flag.
+        uint32_t probeD = 0;
+        uint64_t probeQ = 0;
+        bool dwOk = WdtReadDword(0x1000, probeD);
+        bool qwOk = WdtReadQword(0x1000, probeQ);
+
+        // Consistency check: if both IOCTLs claim success, their low 32
+        // bits must match (same physical DWORD). If they don't, the
+        // "QWORD" IOCTL actually does something else on this driver
+        // build — treat it as unsupported to avoid corrupt reads.
+        if (dwOk && qwOk && (uint32_t)probeQ != probeD) {
+            printf(skCrypt("[SysMonitor] WDT QWORD mismatch: DWORD=0x%08X  QWORD-low=0x%08X — QWORD disabled\n"),
+                   probeD, (uint32_t)probeQ);
+            qwOk = false;
         }
+        m_hasQwordRead = qwOk;
+
+        if (!dwOk && !qwOk) {
+            printf(skCrypt("[SysMonitor] WDT probe FAILED (err=%lu) -- driver up but IOCTLs blocked\n"), GetLastError());
+            // Fail Open() so Engine::Init doesn't proceed with a driver
+            // whose read path is broken. Previously we returned true here
+            // and downstream code cascaded through failed CR3 resolution,
+            // module discovery, etc., with no clear diagnostic.
+            CloseHandle(m_hDevice);
+            m_hDevice = INVALID_HANDLE_VALUE;
+            return false;
+        }
+        printf(skCrypt("[SysMonitor] WDT probe OK  DWORD=0x%08X  QWORD=0x%016llX (qw=%s)\n"),
+               probeD, (unsigned long long)probeQ, qwOk ? "on" : "off");
         return true;
     }
 
@@ -739,13 +766,56 @@ public:
         return true;
     }
 
+    // Direct physical read — bypasses the page cache.
+    // Uses QWORD IOCTLs where the address+size is 8-byte-aligned (the
+    // common case for pointer chain walks and PT reads); falls back to
+    // DWORD IOCTLs for unaligned head/tail bytes.
+    bool ReadPhysDirect(uint64_t physAddr, void* buffer, size_t size) {
+        uint8_t* dst = (uint8_t*)buffer;
+        size_t done = 0;
+        while (done < size) {
+            uint64_t curPA = physAddr + done;
+            size_t remain = size - done;
+
+            // Aligned 8-byte fast path — one IOCTL, no bit-shuffling.
+            // Only used when the driver confirmed QWORD support at Open().
+            if (m_hasQwordRead && (curPA & 7ULL) == 0 && remain >= 8) {
+                uint64_t val = 0;
+                if (!WdtReadQword(curPA, val)) return false;
+                memcpy(dst + done, &val, 8);
+                done += 8;
+                continue;
+            }
+
+            // Otherwise: read the covering DWORD and copy the needed bytes.
+            uint64_t dwordPA = curPA & ~3ULL;
+            size_t   offset  = curPA - dwordPA;
+            size_t   chunk   = (std::min)(remain, (size_t)(4 - offset));
+
+            uint32_t val = 0;
+            if (!WdtReadDword(dwordPA, val)) return false;
+            memcpy(dst + done, ((uint8_t*)&val) + offset, chunk);
+            done += chunk;
+        }
+        return true;
+    }
+
     bool PhysRead(uint64_t physAddr, void* buffer, size_t size) {
         if (!size) return true;
-        // Hard guard: never let a bad PA reach the driver's MmMapIoSpace.
-        // IsSafeToMap uses actual system RAM size + MMIO/ISA blocklist,
-        // so this rejects any PA that could bugcheck 0x1A.
+        // Hard guard: reject any PA that could bugcheck the driver.
         if (!IsSafeToMap(physAddr) || !IsSafeToMap(physAddr + size - 1))
             return false;
+
+        // Threshold: reads smaller than this skip the page cache entirely
+        // and issue direct DWORD IOCTLs. Filling a 4KB page costs 1024
+        // IOCTLs vs. size/4 for a direct read. Break-even is ~4KB, but the
+        // page cache also amortises repeated reads of the same page — so
+        // the useful threshold is lower. 256B is a good middle: pointer
+        // chain walks, entity field reads, and view-matrix reads all fit
+        // in the fast path; only larger structs (bones, big buffers) go
+        // through the cache.
+        constexpr size_t kFastPathBytes = 256;
+
         uint8_t* dst = (uint8_t*)buffer;
         size_t done = 0;
         while (done < size) {
@@ -754,6 +824,7 @@ public:
             size_t   chunk  = (std::min)(size - done, (size_t)(0x1000 - offset));
             if (!IsSafeToMap(pagePA)) return false;
 
+            // Cache probe first — a hit is a memcpy regardless of size.
             EnterCriticalSection(&m_physLock);
             bool hit = false;
             for (int i = 0; i < kPhysPageCacheN; i++) {
@@ -766,15 +837,26 @@ public:
             LeaveCriticalSection(&m_physLock);
 
             if (!hit) {
-                uint8_t page[4096];
-                if (!NalReadPage(pagePA, page)) return false;
-                EnterCriticalSection(&m_physLock);
-                int slot = m_physPageHead;
-                m_physPageHead = (m_physPageHead + 1) % kPhysPageCacheN;
-                m_physPageCache[slot].pa = pagePA;
-                memcpy(m_physPageCache[slot].data, page, 4096);
-                LeaveCriticalSection(&m_physLock);
-                memcpy(dst + done, page + offset, chunk);
+                if (size <= kFastPathBytes) {
+                    // Small read: direct DWORD IOCTLs for this chunk only.
+                    // The page isn't cached afterwards — it wasn't worth 1024
+                    // IOCTLs just to satisfy an 8-byte fetch on this page.
+                    if (!ReadPhysDirect(physAddr + done, dst + done, chunk))
+                        return false;
+                } else {
+                    // Larger read: fill the whole page into cache. Subsequent
+                    // reads of the same page (e.g. every frame) then hit
+                    // the cache and skip IOCTLs entirely.
+                    uint8_t page[4096];
+                    if (!NalReadPage(pagePA, page)) return false;
+                    EnterCriticalSection(&m_physLock);
+                    int slot = m_physPageHead;
+                    m_physPageHead = (m_physPageHead + 1) % kPhysPageCacheN;
+                    m_physPageCache[slot].pa = pagePA;
+                    memcpy(m_physPageCache[slot].data, page, 4096);
+                    LeaveCriticalSection(&m_physLock);
+                    memcpy(dst + done, page + offset, chunk);
+                }
             }
 
             done += chunk;
@@ -791,14 +873,15 @@ private:
     WinDrvReader(const WinDrvReader&) = delete;
     WinDrvReader& operator=(const WinDrvReader&) = delete;
 
-    bool NalReadPage(uint64_t pagePA, uint8_t out[4096]) {
+    // Single-QWORD physical read via WDTKernel IOCTL 0x9C412404.
+    // Halves the IOCTL count for 8-byte reads vs. two DWORD calls.
+    bool WdtReadQword(uint64_t physAddr, uint64_t& out_val) {
         HANDLE hUse = INVALID_HANDLE_VALUE;
         bool   ownedOpen = false;
         if (m_idleMode) {
-            // Serialise idle-mode opens: Cache and Renderer threads both call this.
             EnterCriticalSection(&m_physLock);
             if (!IsOpen()) {
-                m_hDevice = CreateFileA(skCrypt("\\\\.\\Nal"),
+                m_hDevice = CreateFileA(skCrypt("\\\\.\\__WDT__"),
                                         GENERIC_READ | GENERIC_WRITE,
                                         FILE_SHARE_READ | FILE_SHARE_WRITE,
                                         nullptr, OPEN_EXISTING,
@@ -812,99 +895,159 @@ private:
             hUse = m_hDevice;
         }
 
-        pagePA &= ~0xFFFULL;
-
-        // Sanity: output buffer must be non-null. The kernel memcpy step
-        // dereferences this as the destination — a null pointer or a
-        // clearly-bogus low address risks bugcheck 0x3B.
-        if (!out || reinterpret_cast<uintptr_t>(out) < 0x10000ULL) return false;
-
-        // Serialise the whole map/memcpy/unmap sequence. Concurrent threads
-        // running the sequence on different PAs can race the driver's
-        // internal mapping state; one caller finishing unmap while another
-        // is mid-memcpy has been observed to bugcheck the kernel.
-        EnterCriticalSection(&m_ioctlLock);
-
-        // Unified request buffer — one shape for all three cases, so a
-        // driver build that checks InputBufferLength never rejects on size.
-        uint8_t reqBuf[NAL_REQ_SIZE] = {};
-
-        // Step 1: MmMapIoSpace(pagePA, 4096) -> kernel VA
-        auto* map = reinterpret_cast<NalMapIoSpace*>(reqBuf);
-        map->case_number             = NAL_CASE_MAP_IO_SPACE;
-        map->physical_address_to_map = pagePA;
-        map->size                    = 4096;
+        WdtReadReq     req{ physAddr };
+        WdtReadResp64  resp{ 0 };
         DWORD returned = 0;
-        bool ok = DeviceIoControl(hUse, IOCTL_NAL,
-                                  reqBuf, NAL_REQ_SIZE,
-                                  reqBuf, NAL_REQ_SIZE,
-                                  &returned, nullptr) != FALSE;
-        uint64_t kva = map->return_virtual_address;
-
-        // Kernel VAs on x64 always live in the upper half (canonical form,
-        // sign-extended from bit 47). A returned kva outside that range means
-        // the mapping did not happen and dereferencing it would fault the
-        // kernel. Refuse before step 2.
-        if (ok && kva && kva < 0xFFFF800000000000ULL) {
-            kva = 0;
-            ok  = false;
-        }
-
-        if (!ok || !kva) {
-            static bool s_logged = false;
-            if (!s_logged) {
-                s_logged = true;
-                printf(skCrypt("[SysMonitor] Nal MmMapIoSpace failed: err=%lu (PA=0x%llX, kva=0x%llX)\n"),
-                       GetLastError(), (unsigned long long)pagePA, (unsigned long long)kva);
-            }
-            if (ownedOpen) {
-                EnterCriticalSection(&m_physLock);
-                CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE;
-                LeaveCriticalSection(&m_physLock);
-            }
-            LeaveCriticalSection(&m_ioctlLock);
-            return false;
-        }
-
-        // Step 2: memcpy(user_out, kva, 4096) -- executed in kernel context, user VA
-        // is accessible because the caller owns this process.
-        memset(reqBuf, 0, NAL_REQ_SIZE);
-        auto* copy = reinterpret_cast<NalMemCopy*>(reqBuf);
-        copy->case_number = NAL_CASE_MEMCPY;
-        copy->source      = kva;
-        copy->destination = reinterpret_cast<uint64_t>(out);
-        copy->length      = 4096;
-        ok = DeviceIoControl(hUse, IOCTL_NAL,
-                             reqBuf, NAL_REQ_SIZE,
-                             reqBuf, NAL_REQ_SIZE,
-                             &returned, nullptr) != FALSE;
-        if (!ok) {
-            static bool s_logged = false;
-            if (!s_logged) {
-                s_logged = true;
-                printf(skCrypt("[SysMonitor] Nal memcpy failed: err=%lu (PA=0x%llX, kva=0x%llX)\n"),
-                       GetLastError(), (unsigned long long)pagePA, (unsigned long long)kva);
-            }
-        }
-
-        // Step 3: MmUnmapIoSpace(kva, 4096) -- always attempt, even if memcpy failed.
-        memset(reqBuf, 0, NAL_REQ_SIZE);
-        auto* unmap = reinterpret_cast<NalUnmapIoSpace*>(reqBuf);
-        unmap->case_number     = NAL_CASE_UNMAP_IO_SPACE;
-        unmap->virt_address    = kva;
-        unmap->number_of_bytes = 4096;
-        DeviceIoControl(hUse, IOCTL_NAL,
-                        reqBuf, NAL_REQ_SIZE,
-                        reqBuf, NAL_REQ_SIZE,
-                        &returned, nullptr);
+        BOOL  ok = DeviceIoControl(hUse, IOCTL_WDT_READ_QWORD,
+                                   &req,  sizeof(req),
+                                   &resp, sizeof(resp),
+                                   &returned, nullptr);
 
         if (ownedOpen) {
             EnterCriticalSection(&m_physLock);
             CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE;
             LeaveCriticalSection(&m_physLock);
         }
+
+        if (!ok || returned != sizeof(resp)) return false;
+        out_val = resp.value;
+        return true;
+    }
+
+    // Single-DWORD physical read via WDTKernel IOCTL 0x9C412400.
+    // Each call is one full IOCTL — map/read/unmap is done atomically
+    // inside the driver, so we never have overlapping mapping state.
+    bool WdtReadDword(uint64_t physAddr, uint32_t& out_val) {
+        HANDLE hUse = INVALID_HANDLE_VALUE;
+        bool   ownedOpen = false;
+        if (m_idleMode) {
+            EnterCriticalSection(&m_physLock);
+            if (!IsOpen()) {
+                m_hDevice = CreateFileA(skCrypt("\\\\.\\__WDT__"),
+                                        GENERIC_READ | GENERIC_WRITE,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                        nullptr, OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr);
+                ownedOpen = (m_hDevice != INVALID_HANDLE_VALUE);
+            }
+            hUse = m_hDevice;
+            LeaveCriticalSection(&m_physLock);
+            if (hUse == INVALID_HANDLE_VALUE) return false;
+        } else {
+            hUse = m_hDevice;
+        }
+
+        WdtReadReq  req{ physAddr };
+        WdtReadResp resp{ 0 };
+        DWORD returned = 0;
+        BOOL  ok = DeviceIoControl(hUse, IOCTL_WDT_READ_DWORD,
+                                   &req,  sizeof(req),
+                                   &resp, sizeof(resp),
+                                   &returned, nullptr);
+
+        if (ownedOpen) {
+            EnterCriticalSection(&m_physLock);
+            CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE;
+            LeaveCriticalSection(&m_physLock);
+        }
+
+        if (!ok || returned != sizeof(resp)) return false;
+        out_val = resp.value;
+        return true;
+    }
+
+    // Fills a 4KB physical page by issuing 512 sequential QWORD reads
+    // (was 1024 DWORD reads before the QWORD IOCTL was wired up).
+    // Cold path only — the phys-page LRU in PhysRead() means this runs
+    // on first touch of a page; after warmup, most reads hit cache.
+    bool WdtReadPage(uint64_t pagePA, uint8_t out[4096]) {
+        pagePA &= ~0xFFFULL;
+        if (!out || reinterpret_cast<uintptr_t>(out) < 0x10000ULL) return false;
+
+        // PA blacklist: skip pages that have failed before. Each entry
+        // costs one comparison; miss once, skip forever.
+        for (int i = 0; i < kBadPaCount; i++)
+            if (m_badPAs[i] && m_badPAs[i] == pagePA) return false;
+
+        // Serialise so one thread's stream isn't interleaved with another's.
+        // Not strictly required for correctness (each IOCTL is self-contained)
+        // but keeps driver-side cache locality clean.
+        EnterCriticalSection(&m_ioctlLock);
+
+        bool all_ok = true;
+        if (m_hasQwordRead) {
+            uint64_t* dst = reinterpret_cast<uint64_t*>(out);
+            for (int i = 0; i < 512; i++) {
+                if (!WdtReadQword(pagePA + (uint64_t)i * 8, dst[i])) {
+                    all_ok = false;
+                    break;
+                }
+            }
+        } else {
+            uint32_t* dst = reinterpret_cast<uint32_t*>(out);
+            for (int i = 0; i < 1024; i++) {
+                if (!WdtReadDword(pagePA + (uint64_t)i * 4, dst[i])) {
+                    all_ok = false;
+                    break;
+                }
+            }
+        }
+
+        if (!all_ok) {
+            static bool s_logged = false;
+            if (!s_logged) {
+                s_logged = true;
+                printf(skCrypt("[SysMonitor] WDT read failed: err=%lu (PA=0x%llX)\n"),
+                       GetLastError(), (unsigned long long)pagePA);
+            }
+            m_badPAs[m_badPaHead] = pagePA;
+            m_badPaHead = (m_badPaHead + 1) % kBadPaCount;
+        }
+
         LeaveCriticalSection(&m_ioctlLock);
-        return ok;
+        return all_ok;
+    }
+
+    // Compatibility shim — callers still use the old NalReadPage name.
+    bool NalReadPage(uint64_t pagePA, uint8_t out[4096]) {
+        return WdtReadPage(pagePA, out);
+    }
+
+    // Optional: single-DWORD physical write via IOCTL 0x9C41240C.
+    // Kept for completeness; the read-only ESP path never uses this.
+    bool WdtWriteDword(uint64_t physAddr, uint32_t value) {
+        HANDLE hUse = INVALID_HANDLE_VALUE;
+        bool   ownedOpen = false;
+        if (m_idleMode) {
+            EnterCriticalSection(&m_physLock);
+            if (!IsOpen()) {
+                m_hDevice = CreateFileA(skCrypt("\\\\.\\__WDT__"),
+                                        GENERIC_READ | GENERIC_WRITE,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                        nullptr, OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr);
+                ownedOpen = (m_hDevice != INVALID_HANDLE_VALUE);
+            }
+            hUse = m_hDevice;
+            LeaveCriticalSection(&m_physLock);
+            if (hUse == INVALID_HANDLE_VALUE) return false;
+        } else {
+            hUse = m_hDevice;
+        }
+
+        WdtWriteReq req{ physAddr, value };
+        DWORD returned = 0;
+        BOOL  ok = DeviceIoControl(hUse, IOCTL_WDT_WRITE_DWORD,
+                                   &req, sizeof(req),
+                                   nullptr, 0,
+                                   &returned, nullptr);
+
+        if (ownedOpen) {
+            EnterCriticalSection(&m_physLock);
+            CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE;
+            LeaveCriticalSection(&m_physLock);
+        }
+        return ok != FALSE;
     }
 
     uint64_t ReadPhys64(uint64_t physAddr) {
@@ -1180,7 +1323,14 @@ private:
             RTL_OSVERSIONINFOW vi = { sizeof(vi) };
             DWORD build = (pRtlGetVersion && pRtlGetVersion(&vi) == 0) ? vi.dwBuildNumber : 0;
 
-            if (build > 0 && build < 19041) {
+            if (build == 0) {
+                // RtlGetVersion resolution failed. Default to the newest
+                // known layout — target box is Win11 24H2/25H2, wrong
+                // Win10 offsets there would silently misread every EPROCESS
+                // field and cause a cascade of module-discovery failures.
+                printf("[SysMonitor] WARNING: RtlGetVersion failed — assuming Win11 24H2+ EPROCESS layout\n");
+                build = 26100;
+            } else if (build < 19041) {
                 printf("[SysMonitor] WARNING: untested Windows build %lu — EPROCESS offsets may be wrong\n", (unsigned long)build);
             }
 
@@ -1212,10 +1362,17 @@ private:
         return s;
     }
 
-    static constexpr int kPhysPageCacheN = 16;
+    // 512 × 4KB = 2 MB of cached physical pages. Small enough to fit in L2
+    // on any modern CPU, big enough to cover the working set of Cache::Refresh
+    // (client.dll data pages, entity pawns, bone matrices, view matrix)
+    // across many frames without thrashing. Was 16 — that was one order of
+    // magnitude too small for the WDT-driver era where a cold page fill
+    // costs 1024 IOCTLs.
+    static constexpr int kPhysPageCacheN = 512;
     struct PhysPageEntry { uint64_t pa; uint8_t data[4096]; };
 
     bool            m_idleMode         = false;
+    bool            m_hasQwordRead     = false;
     HANDLE          m_hDevice          = INVALID_HANDLE_VALUE;
     uint64_t        m_kernelBase       = 0;
     uint64_t        m_kernelPA         = 0;
@@ -1230,4 +1387,10 @@ private:
     // never have overlapping mappings active in the driver. Prevents a
     // whole class of kernel-side races that can bugcheck 0x3B.
     CRITICAL_SECTION m_ioctlLock;
+    // Small ring of PAs the driver has failed on. Later attempts to read
+    // these are refused up-front. Prevents the same PA re-hammering the
+    // driver after it just faulted on it.
+    static constexpr int kBadPaCount = 64;
+    uint64_t             m_badPAs[kBadPaCount] = {};
+    int                  m_badPaHead = 0;
 };

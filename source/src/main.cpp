@@ -22,7 +22,7 @@
 // ── Per-machine hardware fingerprint ─────────────────────────────────────────
 // Mixes volume serial number + CPUID family/stepping into a stable DWORD.
 // Used to generate a machine-unique driver drop path that avoids a predictable
-// filename IOC like "iqvw64e.sys" while remaining stable across reboots.
+// filename IOC like "WDTKernel.sys" while remaining stable across reboots.
 static DWORD GetHwKey() {
     DWORD serial = 0;
     using GVI_fn = BOOL(WINAPI*)(LPCSTR, LPSTR, DWORD, LPDWORD, LPDWORD, LPDWORD, LPSTR, DWORD);
@@ -35,7 +35,7 @@ static DWORD GetHwKey() {
 
 // ── Driver drop path ──────────────────────────────────────────────────────────
 // Generates a machine-stable path like %SystemRoot%\System32\drivers\A3F19C2B.sys.
-// Copy iqvw64e.sys (Intel NAL) to this path before launching.
+// Copy WDTKernel.sys (Dell Watchdog Timer) to this path before launching.
 static const char* GetDriverPath() {
     static char s_path[MAX_PATH] = {};
     static bool s_ready = false;
@@ -84,7 +84,7 @@ static bool IsDriverLoaded() {
     auto pCreateFileA = RESOLVE(CreateFileA);
     auto pCloseHandle = RESOLVE(CloseHandle);
     if (!pCreateFileA || !pCloseHandle) return false;
-    HANDLE h = pCreateFileA(skCrypt("\\\\.\\Nal"),
+    HANDLE h = pCreateFileA(skCrypt("\\\\.\\__WDT__"),
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, 0, nullptr);
@@ -212,13 +212,13 @@ static bool StartDriver() {
 
     if (GetFileAttributesA(drvPath) == INVALID_FILE_ATTRIBUTES) {
         std::cout << "[!] Driver file not found at: " << drvPath << "\n";
-        std::cout << "    Copy iqvw64e.sys to that path and retry.\n";
+        std::cout << "    Copy WDTKernel.sys to that path and retry.\n";
         pCloseServiceHandle(hSCM);
         return false;
     }
     if (!ValidateDriverFile(drvPath)) {
         std::cout << "[!] Driver file at " << drvPath << " is not a valid PE image.\n";
-        std::cout << "    Re-copy iqvw64e.sys to that path.\n";
+        std::cout << "    Re-copy WDTKernel.sys to that path.\n";
         pCloseServiceHandle(hSCM);
         return false;
     }
@@ -247,7 +247,7 @@ static bool StartDriver() {
         if (*hint) std::cout << " — " << hint;
         std::cout << "\n";
         if (err == 577 || err == 1275) {
-            std::cout << "    Driver blocklist rejected iqvw64e. Options:\n"
+            std::cout << "    Driver blocklist rejected WDTKernel. Options:\n"
                          "      - HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Config"
                          " → VulnerableDriverBlocklistEnable = 0, reboot\n"
                          "      - Or use a Windows build/SKU without the blocklist\n";
@@ -302,7 +302,7 @@ static void StopDriver() {
     pCloseServiceHandle(hSCM);
     // Keep the driver file on disk between runs — the machine-stable filename
     // acts as a persistent one-shot cache. Deleting it forces the user to
-    // re-copy iqvw64e.sys before every launch. If you want strict clean-up
+    // re-copy WDTKernel.sys before every launch. If you want strict clean-up
     // on exit for stealth, uncomment the DeleteFileA call below.
     // DeleteFileA(GetDriverPath());
 }
