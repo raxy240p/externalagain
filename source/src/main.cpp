@@ -80,17 +80,64 @@ static bool IsProcessRunning(const char* exeName) {
     return found;
 }
 
-static bool IsDriverLoaded() {
+// Optional out-param: on failure, receives the exact GetLastError from
+// the CreateFile attempt so callers can distinguish "device not published"
+// (err=2 / ERROR_FILE_NOT_FOUND — driver loaded but never created device
+// object, typical for a PnP driver waiting for hardware) from "device
+// exists but blocked" (err=5 / ERROR_ACCESS_DENIED — DACL rejects us).
+static bool IsDriverLoaded(DWORD* outErr = nullptr) {
     auto pCreateFileA = RESOLVE(CreateFileA);
     auto pCloseHandle = RESOLVE(CloseHandle);
-    if (!pCreateFileA || !pCloseHandle) return false;
+    auto pGetLastError = RESOLVE(GetLastError);
+    if (!pCreateFileA || !pCloseHandle) {
+        if (outErr) *outErr = 0;
+        return false;
+    }
     HANDLE h = pCreateFileA(skCrypt("\\\\.\\__WDT__"),
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, 0, nullptr);
     bool ok = (h != INVALID_HANDLE_VALUE);
-    if (ok) pCloseHandle(h);
+    if (ok) {
+        pCloseHandle(h);
+    } else if (outErr) {
+        *outErr = pGetLastError ? pGetLastError() : 0;
+    }
     return ok;
+}
+
+// Query current service state via SCM. Useful to distinguish "driver
+// crashed after load" (state=STOPPED) from "driver running but device
+// never published" (state=RUNNING, but device unopenable).
+static DWORD QueryServiceState(const char* svcName) {
+    auto pOpenSCManagerA     = RESOLVE(OpenSCManagerA);
+    auto pOpenServiceA       = RESOLVE(OpenServiceA);
+    auto pQueryServiceStatus = RESOLVE(QueryServiceStatus);
+    auto pCloseServiceHandle = RESOLVE(CloseServiceHandle);
+    if (!pOpenSCManagerA || !pOpenServiceA || !pQueryServiceStatus || !pCloseServiceHandle) return 0;
+    SC_HANDLE hSCM = pOpenSCManagerA(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!hSCM) return 0;
+    SC_HANDLE hSvc = pOpenServiceA(hSCM, svcName, SERVICE_QUERY_STATUS);
+    DWORD state = 0;
+    if (hSvc) {
+        SERVICE_STATUS ss{};
+        if (pQueryServiceStatus(hSvc, &ss)) state = ss.dwCurrentState;
+        pCloseServiceHandle(hSvc);
+    }
+    pCloseServiceHandle(hSCM);
+    return state;
+}
+static const char* SvcStateName(DWORD s) {
+    switch (s) {
+        case SERVICE_STOPPED:          return "STOPPED";
+        case SERVICE_START_PENDING:    return "START_PENDING";
+        case SERVICE_STOP_PENDING:     return "STOP_PENDING";
+        case SERVICE_RUNNING:          return "RUNNING";
+        case SERVICE_CONTINUE_PENDING: return "CONTINUE_PENDING";
+        case SERVICE_PAUSE_PENDING:    return "PAUSE_PENDING";
+        case SERVICE_PAUSED:           return "PAUSED";
+        default:                       return "(no service / unknown)";
+    }
 }
 
 // Fast sanity check: the file at drvPath must exist, start with MZ,
@@ -352,9 +399,19 @@ int main()
     // ── Driver loading ────────────────────────────────────────────────────────
     std::cout << "  \033[96m[*]\033[0m Starting driver...\n";
     bool drvStarted = StartDriver();
-    std::cout << (drvStarted
-        ? "  \033[92m[+]\033[0m Driver ready.\n\n"
-        : "  \033[91m[!]\033[0m Driver start failed.\n\n");
+    if (drvStarted) {
+        // Report what SCM thinks so a "loaded but no device" case shows up
+        // immediately — before the 15-second spinner wait.
+        DWORD state = QueryServiceState(GetSvcName());
+        DWORD probeErr = 0;
+        bool  probeOk  = IsDriverLoaded(&probeErr);
+        std::cout << "  \033[92m[+]\033[0m Driver ready.  service=" << SvcStateName(state)
+                  << "  device=" << (probeOk ? "open" : "unavailable");
+        if (!probeOk) std::cout << " (err=" << probeErr << ")";
+        std::cout << "\n\n";
+    } else {
+        std::cout << "  \033[91m[!]\033[0m Driver start failed.\n\n";
+    }
 
     if (!drvStarted) {
         std::cout << "  Press Enter to exit.\n";
@@ -369,8 +426,9 @@ int main()
         int  spinIdx   = 0;
         const char* sp = "|/-\\";
 
+        DWORD lastDrvErr = 0;
         while (!drvReady || !cs2Ready) {
-            drvReady = IsDriverLoaded();
+            drvReady = IsDriverLoaded(&lastDrvErr);
             cs2Ready = IsProcessRunning(skCrypt("cs2.exe"));
 
             std::cout
@@ -383,7 +441,25 @@ int main()
             std::cout.flush();
 
             if (!drvReady && waitedMs >= 15000) {
-                std::cout << "\n\n  \033[91m[!]\033[0m Driver did not load.\n\n  Press Enter to exit.\n";
+                // Diagnostic — spell out exactly why the driver looks up as
+                // "not loaded" so the user isn't left guessing.
+                DWORD state = QueryServiceState(GetSvcName());
+                std::cout << "\n\n  \033[91m[!]\033[0m Driver did not load.\n";
+                std::cout << "      Service:        " << GetSvcName() << " (state=" << SvcStateName(state) << ")\n";
+                std::cout << "      Device probe:   \\\\.\\__WDT__  err=" << lastDrvErr;
+                switch (lastDrvErr) {
+                    case 2:   std::cout << " (ERROR_FILE_NOT_FOUND — driver loaded but never published its device object;\n"
+                                          "                            typically means it's PnP-oriented and needs matching hardware,\n"
+                                          "                            or a policy stripped device creation at load)"; break;
+                    case 5:   std::cout << " (ERROR_ACCESS_DENIED — device exists but its DACL rejects this process)"; break;
+                    case 32:  std::cout << " (ERROR_SHARING_VIOLATION — another handle holds it exclusively)"; break;
+                    case 6:   std::cout << " (ERROR_INVALID_HANDLE — device stack is in a bad state)"; break;
+                    case 21:  std::cout << " (ERROR_NOT_READY — driver still initialising, symlink not yet published)"; break;
+                    case 87:  std::cout << " (ERROR_INVALID_PARAMETER — device path malformed at kernel side)"; break;
+                    case 231: std::cout << " (ERROR_PIPE_BUSY — device serving another client, retry later)"; break;
+                    default:  break;
+                }
+                std::cout << "\n\n  Press Enter to exit.\n";
                 std::cin.get();
                 goto exit;
             }
