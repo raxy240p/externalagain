@@ -8,62 +8,97 @@
 #include <cstring>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <skCrypter/skCrypter.hpp>
 #include <lazy_importer/lazy_importer.hpp>
 #include "core/anti_debug/AntiDebug.hpp"
 
-// WDTKernel.sys (Dell Watchdog Timer Kernel Driver v1.4.1.0, WHQL-signed).
-// SHA256: 0E27BEC347CA0050C455467BD8D774175C503B8AA1AF3411E94966F7DC6B28B7
+// SIVX64.sys (System Information Viewer X64 driver, Ray Hinchliffe, v5.85).
+// SHA256: 33903E8FA9F0A2ACAA4784D645E309B0BD780693824B6C2C5FEF257238C77478
+// Signer: Microsoft Windows Hardware Compatibility Publisher (WHCP).
 // Not on Microsoft's HVCI vulnerable-driver blocklist as of Win11 24H2/25H2.
+// Confirmed to load under HVCI.
 //
-// Device: \\.\__WDT__
+// Device: \Device\SIVDRIVER  →  \DosDevices\SIVDRIVER  →  user-mode "\\.\SIVDRIVER"
 //
-// IOCTL scheme — direct physical-memory access, no MmMapIoSpace state
-// leaks across calls (each IOCTL maps, reads/writes, and unmaps within
-// one kernel entry). Concurrent-safe from user side.
+// Import-scan evasion: MmMapIoSpace / MmMapIoSpaceEx are resolved at DriverEntry
+// via MmGetSystemRoutineAddress (they live in .rdata as wide UNICODE_STRING
+// arguments only, not in the PE import table). Static import scanners see
+// only MmUnmapIoSpace + MmGetSystemRoutineAddress — the "read" primitive is
+// invisible to naïve fingerprinting.
 //
-//   0x9C412400  Read  physical DWORD:  in=uint64_t PA,               out=uint32_t
-//   0x9C412404  Read  physical QWORD:  in=uint64_t PA,               out=uint64_t
-//   0x9C41240C  Write physical DWORD:  in=uint64_t PA + uint32_t val, out=none
-//   0x9C412410  Write physical QWORD:  in=uint64_t PA + uint64_t val, out=none
+// IOCTL surface (dispatch on raw IoControlCode, no CTL_CODE wrapper):
+//   0x08  IOCTL_SIV_RDMSR             (RDMSR)
+//   0x0C  IOCTL_SIV_WRMSR             (WRMSR, whitelisted MSR IDs only)
+//   0x10  IOCTL_SIV_PHY_MEMORY        ← we use this: arbitrary-length phys R
+//   0x13  IOCTL_SIV_BAR_MEMORY        (PCI BAR I/O)
+//   0x14  IOCTL_SIV_BIG_MEMORY        (scatter-gather phys R/W, 0x48+ descriptor)
+//   … others (KCS, PCIBUS, SMBUS, disk, ACPI, mutant-owner) not used here
 //
-// The QWORD variants were verified present in the dispatch table at
-// offset 0x2936 of WDTKernel.sys v1.4.1.0. Using them halves IOCTL
-// count for 8-byte reads (pointer chain walks, PTE reads).
+// IOCTL 0x10 primitive (verified against SIVX64.sys dispatch @ 0x22164):
+//   METHOD_BUFFERED. InputBuffer[0..7] = uint64 physical address.
+//   InputLength ∈ [4, 0x40000] sets the map/copy size. OutputLength ≥ 8.
+//   Driver: MmMapIoSpace(PA, InputLength) → dword-copy into SystemBuffer.
+//   Kernel then copies min(InputLength, OutputLength) bytes of SystemBuffer
+//   back to the caller's OutputBuffer — so OutputBuffer receives the read.
+//   The driver keeps an internal LRU of mappings, so repeated reads of the
+//   same PA range skip MmMapIoSpace/MmUnmapIoSpace on the kernel side too.
 //
-// Trade-off vs. the previous driver's page-at-a-time memcpy: cold-cache
-// page fills still cost 512 IOCTLs (via QWORD) or 1024 (via DWORD).
-// The phys-page LRU in PhysRead() amortises this across re-reads of
-// the same page (the hot path after game state stabilises), and the
-// small-read fast path avoids page fills for reads ≤ 256 bytes.
-#define IOCTL_WDT_READ_DWORD            0x9C412400u
-#define IOCTL_WDT_READ_QWORD            0x9C412404u
-#define IOCTL_WDT_WRITE_DWORD           0x9C41240Cu
-#define IOCTL_WDT_WRITE_QWORD           0x9C412410u
+// One IOCTL per page (or per bulk-read up to 256 KB) vs. WDTKernel's 512
+// QWORD IOCTLs per page — ~500× IOCTL reduction on cold-cache path.
+#define IOCTL_SIV_PHY_MEMORY            0x10u
+
+// Minimum InputBuffer size to safely hold the 8-byte phys address.
+// InputLength < 8 would leave the upper bytes of the PA as uninitialised
+// SystemBuffer contents (kernel pool), so the driver would map junk.
+#define SIV_MIN_READ                    8u
+// Driver's absolute per-IOCTL size ceiling (from `cmp [r13-4], 0x3FFFC`
+// in the dispatch — InputLength - 4 ≤ 0x3FFFC → InputLength ≤ 0x40000).
+#define SIV_MAX_READ                    0x40000u
+
+// SIV IOCTL 0x10 return-contract summary (verified in disassembly):
+//
+//   Path                                     IoStatus.Status       Information
+//   Success (simple-copy)  @ 0x22449         STATUS_SUCCESS  (0)   = InputLength
+//   MmMapIoSpace fail      @ 0x22456         0xC00000E6            0 (entry default)
+//   Validation error       @ entry 0x21a1e   0xC0000004            0
+//   InputLength range fail @ 0x22171         (falls to default)    0
+//   OutputLength < 8       @ 0x22167         (falls to default)    0
+//
+// Win32 mapping seen at DeviceIoControl:
+//   STATUS_SUCCESS (0)                → returns TRUE, GetLastError undefined
+//   0xC000000D INVALID_PARAMETER      → FALSE, err = 87
+//   0xC0000004 INFO_LENGTH_MISMATCH   → FALSE, err = 24 (BAD_LENGTH)
+//   0xC00000E6                        → FALSE, err = 87 (or 1359 INTERNAL_ERROR)
+//   0xC0000010 INVALID_DEVICE_REQUEST → FALSE, err = 1 (INVALID_FUNCTION)
+//   0xC0000022 ACCESS_DENIED          → FALSE, err = 5
+//   Handle broken (session-teardown)  → FALSE, err = 6  (INVALID_HANDLE)
+//   Kernel low resources              → FALSE, err = 1450 (NO_SYSTEM_RESOURCES)
+//
+// SivReadPhys uses these codes to (a) classify a failure for logging, and
+// (b) decide whether to retry once (transient resource pressure only —
+// never retry a hard validation reject, which would just re-fault).
+enum class SivFail : uint8_t {
+    Ok            = 0,   // read succeeded
+    BadArgs       = 1,   // caller violated preconditions (size or ptr)
+    HandleFailed  = 2,   // idle-mode reopen returned INVALID_HANDLE_VALUE
+    IoctlDenied   = 3,   // err = 5, DACL blocks
+    IoctlRejected = 4,   // err = 87 / 24 / 1, driver refused params
+    HandleStale   = 5,   // err = 6, handle went bad (session race)
+    Transient     = 6,   // err = 1450, retryable
+    PartialReturn = 7,   // ok but returned != size (never seen — defensive)
+    UnknownError  = 8,   // any other Win32 err
+};
 
 #pragma pack(push, 1)
-struct WdtReadReq {
-    uint64_t phys_addr;                 // IN
+// The complete SIV_PHY_MEMORY input in simple-read mode is just a physical
+// address followed by padding; the padding gets overwritten in place by
+// the kernel side and returned as the read payload. Any Input/OutputBuffer
+// of the same length ≥ 8 works — we just cast the head to this.
+struct SivPhyMemReq {
+    uint64_t phys_addr;                 // IN — 8 bytes at offset 0
 };
-struct WdtReadResp {
-    uint32_t value;                     // OUT (DWORD variant)
-};
-struct WdtReadResp64 {
-    uint64_t value;                     // OUT (QWORD variant)
-};
-struct WdtWriteReq {
-    uint64_t phys_addr;                 // IN
-    uint32_t value;                     // IN (DWORD variant)
-};
-struct WdtWriteReq64 {
-    uint64_t phys_addr;                 // IN
-    uint64_t value;                     // IN (QWORD variant)
-};
-static_assert(sizeof(WdtReadReq)     == 0x08, "read req size");
-static_assert(sizeof(WdtReadResp)    == 0x04, "read resp size");
-static_assert(sizeof(WdtReadResp64)  == 0x08, "read64 resp size");
-static_assert(sizeof(WdtWriteReq)    == 0x0C, "write req size");
-static_assert(sizeof(WdtWriteReq64)  == 0x10, "write64 req size");
+static_assert(sizeof(SivPhyMemReq) == 0x08, "SIV PHY_MEMORY header size");
 #pragma pack(pop)
 
 class WinDrvReader {
@@ -77,18 +112,17 @@ public:
 
     bool Open() {
         if (IsOpen()) return true;
-        DBG_PRINT("[wdt] Opening device...\n");
-        // Try each (path, access) pair in the order they've historically worked
-        // for KMDF-style Nal-family drivers. First success wins.
+        DBG_PRINT("[siv] Opening device...\n");
+        // Try each (path, access) pair. First success wins.
         //   - GENERIC_READ|WRITE:       normal admin access
         //   - GENERIC_READ:             device with read-only DACL
-        //   - SYNCHRONIZE / 0:          IOCTL 0x9C412400 declares FILE_ANY_ACCESS,
+        //   - SYNCHRONIZE / 0:          IOCTL 0x10 declares FILE_ANY_ACCESS,
         //                               so no read/write rights are strictly needed
         //   - GLOBALROOT / global path: session-isolation fallback
         // Also retries ERROR_FILE_NOT_FOUND (symlink publish race) up to 10x.
         struct Attempt { const char* path; DWORD access; };
-        static const char* kPathA = skCrypt("\\\\.\\__WDT__");
-        static const char* kPathB = skCrypt("\\\\.\\GLOBALROOT\\Device\\__WDT__");
+        static const char* kPathA = skCrypt("\\\\.\\SIVDRIVER");
+        static const char* kPathB = skCrypt("\\\\.\\GLOBALROOT\\Device\\SIVDRIVER");
         Attempt attempts[] = {
             { kPathA, GENERIC_READ | GENERIC_WRITE },
             { kPathA, GENERIC_READ                 },
@@ -113,46 +147,52 @@ public:
             Sleep(100);
         }
         if (m_hDevice == INVALID_HANDLE_VALUE) {
-            DBG_PRINT("[wdt] Failed to open device: err=%lu\n", lastErr);
-            if (lastErr == 2) DBG_PRINT("[wdt]   (device not found -- driver not loaded)\n");
-            else if (lastErr == 5) DBG_PRINT("[wdt]   (access denied on every access mode -- DACL blocks user-mode entirely)\n");
+            DBG_PRINT("[siv] Failed to open device: err=%lu\n", lastErr);
+            if (lastErr == 2) DBG_PRINT("[siv]   (device not found -- driver not loaded)\n");
+            else if (lastErr == 5) DBG_PRINT("[siv]   (access denied on every access mode -- DACL blocks user-mode entirely)\n");
             return false;
         }
-        DBG_PRINT("[wdt] Device opened: handle=0x%p\n", (void*)m_hDevice);
-        // Probe both IOCTLs at PA=0x1000 (real RAM, always mapped). Confirms
-        // driver dispatch and populates the QWORD-capability flag.
-        uint32_t probeD = 0;
-        uint64_t probeQ = 0;
-        bool dwOk = WdtReadDword(0x1000, probeD);
-        bool qwOk = WdtReadQword(0x1000, probeQ);
+        DBG_PRINT("[siv] Device opened: handle=0x%p\n", (void*)m_hDevice);
+        // Probe IOCTL 0x10 at PA=0x1000 (real RAM, always mapped) with an
+        // 8-byte read. One primitive, no D/Q divergence to check.
+        uint64_t probe = 0;
+        bool ok = SivReadPhys(0x1000, &probe, sizeof(probe));
 
-        // Consistency check: if both IOCTLs claim success, their low 32
-        // bits must match (same physical DWORD). If they don't, the
-        // "QWORD" IOCTL actually does something else on this driver
-        // build — treat it as unsupported to avoid corrupt reads.
-        if (dwOk && qwOk && (uint32_t)probeQ != probeD) {
-            printf(skCrypt("[SysMonitor] WDT QWORD mismatch: DWORD=0x%08X  QWORD-low=0x%08X — QWORD disabled\n"),
-                   probeD, (uint32_t)probeQ);
-            qwOk = false;
-        }
-        m_hasQwordRead = qwOk;
-
-        if (!dwOk && !qwOk) {
-            printf(skCrypt("[SysMonitor] WDT probe FAILED (err=%lu) -- driver up but IOCTLs blocked\n"), GetLastError());
+        if (!ok) {
+            printf(skCrypt("[SysMonitor] SIV probe FAILED (err=%lu) -- driver up but IOCTL 0x10 blocked\n"),
+                   GetLastError());
             // Fail Open() so Engine::Init doesn't proceed with a driver
-            // whose read path is broken. Previously we returned true here
-            // and downstream code cascaded through failed CR3 resolution,
-            // module discovery, etc., with no clear diagnostic.
+            // whose read path is broken. Downstream code cascading through
+            // failed CR3 resolution / module discovery gives no clear
+            // diagnostic; failing here does.
             CloseHandle(m_hDevice);
             m_hDevice = INVALID_HANDLE_VALUE;
             return false;
         }
-        printf(skCrypt("[SysMonitor] WDT probe OK  DWORD=0x%08X  QWORD=0x%016llX (qw=%s)\n"),
-               probeD, (unsigned long long)probeQ, qwOk ? "on" : "off");
+        printf(skCrypt("[SysMonitor] SIV probe OK  PA=0x1000 -> 0x%016llX\n"),
+               (unsigned long long)probe);
         return true;
     }
 
     void FlushDriverTable() {
+    }
+
+    // Clear the "driver is broken" circuit breaker latched by SivReadPhys
+    // after kIoFailStreakBreaker consecutive IOCTL failures. Call after
+    // re-loading the driver service (e.g. after RecoverDriverDevice) so
+    // subsequent reads are attempted again. Also resets the streak counter
+    // and per-code log budgets so a fresh incident logs from scratch.
+    void ResetIoBreaker() {
+        m_ioBroken.store(false, std::memory_order_release);
+        m_ioFailStreak.store(0, std::memory_order_release);
+        for (auto& c : m_failLogCounts) c.store(0, std::memory_order_release);
+    }
+
+    // True if the circuit breaker has latched. Callers that want to
+    // proactively fall back (or surface the state in a diagnostic UI)
+    // can poll this without stat-inspecting through a failing read.
+    bool IsIoBroken() const {
+        return m_ioBroken.load(std::memory_order_acquire);
     }
 
     // Idle mode: close the device handle when not reading, reopen per-IOCTL.
@@ -787,34 +827,33 @@ public:
     }
 
     // Direct physical read — bypasses the page cache.
-    // Uses QWORD IOCTLs where the address+size is 8-byte-aligned (the
-    // common case for pointer chain walks and PT reads); falls back to
-    // DWORD IOCTLs for unaligned head/tail bytes.
+    // Under SIV, one IOCTL handles the whole request in a single MmMapIoSpace
+    // regardless of alignment or size (up to SIV_MAX_READ). The driver's
+    // internal mapping cache also amortises MmMapIoSpace on the kernel side,
+    // so consecutive reads of the same page group stay cheap.
+    // Sizes above the ceiling are split into ≤ SIV_MAX_READ chunks; sizes
+    // below SIV_MIN_READ pad up to the min via a temporary and copy.
     bool ReadPhysDirect(uint64_t physAddr, void* buffer, size_t size) {
         uint8_t* dst = (uint8_t*)buffer;
         size_t done = 0;
         while (done < size) {
-            uint64_t curPA = physAddr + done;
             size_t remain = size - done;
+            size_t chunk  = (std::min)(remain, (size_t)SIV_MAX_READ);
 
-            // Aligned 8-byte fast path — one IOCTL, no bit-shuffling.
-            // Only used when the driver confirmed QWORD support at Open().
-            if (m_hasQwordRead && (curPA & 7ULL) == 0 && remain >= 8) {
-                uint64_t val = 0;
-                if (!WdtReadQword(curPA, val)) return false;
-                memcpy(dst + done, &val, 8);
-                done += 8;
+            if (chunk >= SIV_MIN_READ) {
+                if (!SivReadPhys(physAddr + done, dst + done, chunk))
+                    return false;
+                done += chunk;
                 continue;
             }
 
-            // Otherwise: read the covering DWORD and copy the needed bytes.
-            uint64_t dwordPA = curPA & ~3ULL;
-            size_t   offset  = curPA - dwordPA;
-            size_t   chunk   = (std::min)(remain, (size_t)(4 - offset));
-
-            uint32_t val = 0;
-            if (!WdtReadDword(dwordPA, val)) return false;
-            memcpy(dst + done, ((uint8_t*)&val) + offset, chunk);
+            // Sub-min request: read SIV_MIN_READ into a stack buffer and
+            // copy the leading `chunk` bytes. IOCTL cost is per-call, not
+            // per-byte, so a small overshoot is free.
+            uint8_t tmp[SIV_MIN_READ] = {};
+            if (!SivReadPhys(physAddr + done, tmp, sizeof(tmp)))
+                return false;
+            memcpy(dst + done, tmp, chunk);
             done += chunk;
         }
         return true;
@@ -826,14 +865,14 @@ public:
         if (!IsSafeToMap(physAddr) || !IsSafeToMap(physAddr + size - 1))
             return false;
 
-        // Threshold: reads smaller than this skip the page cache entirely
-        // and issue direct DWORD IOCTLs. Filling a 4KB page costs 1024
-        // IOCTLs vs. size/4 for a direct read. Break-even is ~4KB, but the
-        // page cache also amortises repeated reads of the same page — so
-        // the useful threshold is lower. 256B is a good middle: pointer
-        // chain walks, entity field reads, and view-matrix reads all fit
-        // in the fast path; only larger structs (bones, big buffers) go
-        // through the cache.
+        // Threshold: total requests ≤ this skip the page-cache slot fill and
+        // just issue one IOCTL for the exact bytes needed. Under SIV, both
+        // paths cost one IOCTL — the threshold is about page-cache economics,
+        // not IOCTL count: 4 KB of RAM per slot is only worth spending on
+        // pages likely to be re-read (repeated pointer chain walks, entity
+        // struct re-touches, view-matrix reads). One-off small reads (single
+        // fields, header probes) shouldn't evict a hot page slot for a
+        // page that'll never be read again. 256 B stays a good middle.
         constexpr size_t kFastPathBytes = 256;
 
         uint8_t* dst = (uint8_t*)buffer;
@@ -858,9 +897,9 @@ public:
 
             if (!hit) {
                 if (size <= kFastPathBytes) {
-                    // Small read: direct DWORD IOCTLs for this chunk only.
-                    // The page isn't cached afterwards — it wasn't worth 1024
-                    // IOCTLs just to satisfy an 8-byte fetch on this page.
+                    // Small read: one IOCTL for exactly `chunk` bytes.
+                    // The page isn't slotted in the LRU afterwards — a
+                    // one-off small read shouldn't evict a hot page.
                     if (!ReadPhysDirect(physAddr + done, dst + done, chunk))
                         return false;
                 } else {
@@ -893,15 +932,120 @@ private:
     WinDrvReader(const WinDrvReader&) = delete;
     WinDrvReader& operator=(const WinDrvReader&) = delete;
 
-    // Single-QWORD physical read via WDTKernel IOCTL 0x9C412404.
-    // Halves the IOCTL count for 8-byte reads vs. two DWORD calls.
-    bool WdtReadQword(uint64_t physAddr, uint64_t& out_val) {
+    // Classify a DeviceIoControl failure into a SivFail code from the Win32
+    // error and byte count. Keeps the retry decision and the log tagging
+    // out of the hot happy path.
+    static SivFail ClassifySivFail(BOOL ok, DWORD returned, DWORD requestedSize) {
+        if (ok != FALSE) {
+            if (returned == requestedSize) return SivFail::Ok;
+            return SivFail::PartialReturn;
+        }
+        DWORD err = GetLastError();
+        switch (err) {
+            case 5:                              return SivFail::IoctlDenied;
+            case 6:                              return SivFail::HandleStale;
+            case 1:
+            case 24:
+            case 87:                             return SivFail::IoctlRejected;
+            case 1450:                           return SivFail::Transient;
+            default:                             return SivFail::UnknownError;
+        }
+    }
+
+    // Only pipe-death signals count toward the circuit breaker — i.e. failures
+    // where "the driver connection itself is broken" is a strictly better
+    // hypothesis than "this particular PA is unmappable". A stale handle,
+    // a refused reopen, or an access denial appearing mid-session means the
+    // whole path is gone (anti-cheat teardown, unload, DACL change). Per-PA
+    // rejections do NOT count — BruteForceCr3 and BulkPTScan legitimately hit
+    // dozens or hundreds of driver-refused PAs during scanning; letting those
+    // trip the breaker would masquerade "healthy driver, some reserved-memory
+    // PAs" as "driver dead" and false-negative Engine::Init at CR3 resolution.
+    static bool IsPipeDeath(SivFail cls) {
+        return cls == SivFail::HandleStale
+            || cls == SivFail::HandleFailed
+            || cls == SivFail::IoctlDenied;
+    }
+
+    static const char* SivFailName(SivFail f) {
+        switch (f) {
+            case SivFail::Ok:            return "ok";
+            case SivFail::BadArgs:       return "bad-args";
+            case SivFail::HandleFailed:  return "handle-failed";
+            case SivFail::IoctlDenied:   return "denied(err5)";
+            case SivFail::IoctlRejected: return "rejected(err1/24/87)";
+            case SivFail::HandleStale:   return "handle-stale(err6)";
+            case SivFail::Transient:     return "transient(err1450)";
+            case SivFail::PartialReturn: return "partial-return";
+            case SivFail::UnknownError:  return "unknown";
+        }
+        return "?";
+    }
+
+    // Rate-limited failure logger. Each SivFail code prints at most
+    // kIoFailLogCap times per run — a persistent problem stays visible in
+    // the console without turning into a scroll of spam. The message
+    // carries every bit the operator actually needs to root-cause: which
+    // PA / size we asked for, which class of failure the driver returned,
+    // and the raw Win32 err so it can be cross-referenced against MSDN.
+    void NoteSivFail(SivFail cls, uint64_t pa, DWORD size, DWORD returned, DWORD err) {
+        auto idx = static_cast<size_t>(cls);
+        if (idx >= (size_t)kFailLogSlots) return;
+        int n = m_failLogCounts[idx].fetch_add(1, std::memory_order_relaxed);
+        if (n < kIoFailLogCap) {
+            printf(skCrypt("[SysMonitor] SIV IOCTL 0x10 failed: %s  pa=0x%llX  size=%u  returned=%u  err=%lu\n"),
+                   SivFailName(cls),
+                   (unsigned long long)pa,
+                   (unsigned)size,
+                   (unsigned)returned,
+                   (unsigned long)err);
+        } else if (n == kIoFailLogCap) {
+            printf(skCrypt("[SysMonitor] SIV IOCTL 0x10: further %s failures suppressed (cap=%d)\n"),
+                   SivFailName(cls), kIoFailLogCap);
+        }
+    }
+
+    // Single arbitrary-length physical read via SIV IOCTL 0x10 (PHY_MEMORY).
+    // METHOD_BUFFERED: kernel copies the caller's InputBuffer into a
+    // SystemBuffer, driver reads PA into that same SystemBuffer, kernel
+    // copies min(InputLength, OutputLength) bytes back to OutputBuffer.
+    // We use one contiguous buffer where the leading 8 bytes carry the PA
+    // and the buffer receives the read on return.
+    //
+    // Preconditions (caller-enforced upstream by PhysRead / ReadPhysDirect):
+    //   - `size` ∈ [SIV_MIN_READ, SIV_MAX_READ]
+    //   - `out`  is user-mode writable for `size` bytes
+    //
+    // Idle-mode retains the "reopen per call, close after" pattern so the
+    // process handle table shows no live \\.\SIVDRIVER handle between scans.
+    //
+    // Failure discipline:
+    //   - Transient (err=1450, no system resources) → retry ONCE with a
+    //     100 μs KeDelayExecutionThread-equivalent pause. Never retry a
+    //     hard validation reject — it will just re-fault deterministically.
+    //   - After kIoFailStreakBreaker consecutive failures, mark the driver
+    //     dead and fast-fail without hitting the IOCTL (avoids hammering
+    //     a driver that's been unloaded mid-session, e.g. by anti-cheat).
+    //   - Each distinct SivFail code logs at most kIoFailLogCap times so
+    //     a persistent problem stays visible without spamming the console.
+    bool SivReadPhys(uint64_t physAddr, void* out, size_t size) {
+        if (!out || size < SIV_MIN_READ || size > SIV_MAX_READ) {
+            NoteSivFail(SivFail::BadArgs, physAddr, (DWORD)size, 0, 0);
+            return false;
+        }
+
+        // Circuit breaker — if the driver has been failing every request
+        // for a while (session-teardown, unloaded, or anti-cheat scrubbed
+        // the device object) we don't want to keep waking the kernel just
+        // to fail. Callers see a clean bool false and stop cascading.
+        if (m_ioBroken.load(std::memory_order_acquire)) return false;
+
         HANDLE hUse = INVALID_HANDLE_VALUE;
         bool   ownedOpen = false;
         if (m_idleMode) {
             EnterCriticalSection(&m_physLock);
             if (!IsOpen()) {
-                m_hDevice = CreateFileA(skCrypt("\\\\.\\__WDT__"),
+                m_hDevice = CreateFileA(skCrypt("\\\\.\\SIVDRIVER"),
                                         GENERIC_READ | GENERIC_WRITE,
                                         FILE_SHARE_READ | FILE_SHARE_WRITE,
                                         nullptr, OPEN_EXISTING,
@@ -910,60 +1054,72 @@ private:
             }
             hUse = m_hDevice;
             LeaveCriticalSection(&m_physLock);
-            if (hUse == INVALID_HANDLE_VALUE) return false;
-        } else {
-            hUse = m_hDevice;
-        }
-
-        WdtReadReq     req{ physAddr };
-        WdtReadResp64  resp{ 0 };
-        DWORD returned = 0;
-        BOOL  ok = DeviceIoControl(hUse, IOCTL_WDT_READ_QWORD,
-                                   &req,  sizeof(req),
-                                   &resp, sizeof(resp),
-                                   &returned, nullptr);
-
-        if (ownedOpen) {
-            EnterCriticalSection(&m_physLock);
-            CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE;
-            LeaveCriticalSection(&m_physLock);
-        }
-
-        if (!ok || returned != sizeof(resp)) return false;
-        out_val = resp.value;
-        return true;
-    }
-
-    // Single-DWORD physical read via WDTKernel IOCTL 0x9C412400.
-    // Each call is one full IOCTL — map/read/unmap is done atomically
-    // inside the driver, so we never have overlapping mapping state.
-    bool WdtReadDword(uint64_t physAddr, uint32_t& out_val) {
-        HANDLE hUse = INVALID_HANDLE_VALUE;
-        bool   ownedOpen = false;
-        if (m_idleMode) {
-            EnterCriticalSection(&m_physLock);
-            if (!IsOpen()) {
-                m_hDevice = CreateFileA(skCrypt("\\\\.\\__WDT__"),
-                                        GENERIC_READ | GENERIC_WRITE,
-                                        FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                        nullptr, OPEN_EXISTING,
-                                        FILE_ATTRIBUTE_NORMAL, nullptr);
-                ownedOpen = (m_hDevice != INVALID_HANDLE_VALUE);
+            if (hUse == INVALID_HANDLE_VALUE) {
+                NoteSivFail(SivFail::HandleFailed, physAddr, (DWORD)size, 0, GetLastError());
+                return false;
             }
-            hUse = m_hDevice;
-            LeaveCriticalSection(&m_physLock);
-            if (hUse == INVALID_HANDLE_VALUE) return false;
         } else {
             hUse = m_hDevice;
         }
 
-        WdtReadReq  req{ physAddr };
-        WdtReadResp resp{ 0 };
+        // Stamp the 8-byte PA header at the head of the caller's buffer.
+        // The driver will overwrite these same 8 bytes with the first 8
+        // bytes of the read payload — exactly the semantics we want.
+        // Use memcpy rather than a struct write so an unaligned `out`
+        // pointer stays well-defined (x64 tolerates it in practice, but
+        // the analyzer is happier and future ARM64 ports are trivial).
+        memcpy(out, &physAddr, sizeof(physAddr));
+
+        // Zero the mode-selector region past the PA header.
+        //
+        // Verified against the SIV dispatch @ 0x22164 (IOCTL 0x10):
+        //   0x2219b:  cmp OutputBufferLength, 0x30      ; exact-48 gate
+        //   0x221a3:  jne <simple_mode>
+        //   0x221a5:  mov eax, [InputBuffer + 0x10]      ; mode-A selector
+        //   0x221b0:  test eax, eax
+        //   0x221b2:  je  <simple_mode>                  ; fall through if 0
+        //   ...       (else takes byte-mask/offset-stride path)
+        //     0x22305:  cmp DWORD [InputBuffer + 0x1c], 4  ; mode-B selector
+        //
+        // So an exact-48-byte read (`bone_data` is 32B and some entity
+        // sub-structs land at ~48B) whose caller-provided buffer happens
+        // to hold non-zero bytes at offsets 0x10..0x13 diverts the driver
+        // into a corrupt-data path. Zeroing offsets 8..31 kills both
+        // selectors regardless of what stack/heap junk was in `out`, at
+        // the cost of a 24-byte memset that vanishes into DRAM bandwidth
+        // (< 10 ns on DDR3-2800).
+        if (size > sizeof(physAddr)) {
+            size_t clear = (std::min)(size - sizeof(physAddr), (size_t)24);
+            memset(reinterpret_cast<uint8_t*>(out) + sizeof(physAddr), 0, clear);
+        }
+
         DWORD returned = 0;
-        BOOL  ok = DeviceIoControl(hUse, IOCTL_WDT_READ_DWORD,
-                                   &req,  sizeof(req),
-                                   &resp, sizeof(resp),
+        BOOL  ok = DeviceIoControl(hUse, IOCTL_SIV_PHY_MEMORY,
+                                   out, (DWORD)size,   // Input  (PA header)
+                                   out, (DWORD)size,   // Output (read data)
                                    &returned, nullptr);
+
+        SivFail cls = ClassifySivFail(ok, returned, (DWORD)size);
+
+        // Single retry for transient resource pressure. The re-stamp of the
+        // PA is required because success/failure both consume the input
+        // header (kernel copies it to SystemBuffer once per call). Note we
+        // do NOT retry PartialReturn — a driver returning short bytes on a
+        // simple-copy IOCTL is a semantics violation, not resource pressure.
+        if (cls == SivFail::Transient) {
+            Sleep(0);                          // yield CPU, cheap
+            memcpy(out, &physAddr, sizeof(physAddr));
+            if (size > sizeof(physAddr)) {
+                size_t clear = (std::min)(size - sizeof(physAddr), (size_t)24);
+                memset(reinterpret_cast<uint8_t*>(out) + sizeof(physAddr), 0, clear);
+            }
+            returned = 0;
+            ok = DeviceIoControl(hUse, IOCTL_SIV_PHY_MEMORY,
+                                 out, (DWORD)size,
+                                 out, (DWORD)size,
+                                 &returned, nullptr);
+            cls = ClassifySivFail(ok, returned, (DWORD)size);
+        }
 
         if (ownedOpen) {
             EnterCriticalSection(&m_physLock);
@@ -971,103 +1127,64 @@ private:
             LeaveCriticalSection(&m_physLock);
         }
 
-        if (!ok || returned != sizeof(resp)) return false;
-        out_val = resp.value;
-        return true;
+        if (cls == SivFail::Ok) {
+            m_ioFailStreak.store(0, std::memory_order_release);
+            return true;
+        }
+
+        NoteSivFail(cls, physAddr, (DWORD)size, returned, GetLastError());
+
+        // Only pipe-death failures accumulate toward the breaker. A per-PA
+        // rejection RESETS the streak — it tells us the driver is alive and
+        // rejecting individual requests, which is exactly what we want it
+        // to do for reserved-memory regions during CR3 / PT scanning.
+        if (IsPipeDeath(cls)) {
+            int streak = m_ioFailStreak.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (streak >= kIoFailStreakBreaker) {
+                if (!m_ioBroken.exchange(true, std::memory_order_acq_rel)) {
+                    printf(skCrypt("[SysMonitor] SIV driver pipe dead (%d consecutive %s failures) — fast-failing further reads. Reset via WinDrvReader::Get().ResetIoBreaker() after re-loading.\n"),
+                           streak, SivFailName(cls));
+                }
+            }
+        } else {
+            m_ioFailStreak.store(0, std::memory_order_release);
+        }
+        return false;
     }
 
-    // Fills a 4KB physical page by issuing 512 sequential QWORD reads
-    // (was 1024 DWORD reads before the QWORD IOCTL was wired up).
-    // Cold path only — the phys-page LRU in PhysRead() means this runs
-    // on first touch of a page; after warmup, most reads hit cache.
-    bool WdtReadPage(uint64_t pagePA, uint8_t out[4096]) {
+    // Fills a 4KB physical page in a SINGLE IOCTL. WDTKernel needed 512
+    // (QWORD) or 1024 (DWORD); SIV maps + copies the whole page at once.
+    bool SivReadPage(uint64_t pagePA, uint8_t out[4096]) {
         pagePA &= ~0xFFFULL;
         if (!out || reinterpret_cast<uintptr_t>(out) < 0x10000ULL) return false;
 
-        // PA blacklist: skip pages that have failed before. Each entry
-        // costs one comparison; miss once, skip forever.
+        // PA blacklist: skip pages that have failed before. Miss once, skip forever.
         for (int i = 0; i < kBadPaCount; i++)
             if (m_badPAs[i] && m_badPAs[i] == pagePA) return false;
 
         // Serialise so one thread's stream isn't interleaved with another's.
-        // Not strictly required for correctness (each IOCTL is self-contained)
-        // but keeps driver-side cache locality clean.
+        // Not strictly required for correctness (each IOCTL is self-contained
+        // and the SIV driver has its own mapping-cache mutex) but keeps
+        // driver-side cache locality clean.
         EnterCriticalSection(&m_ioctlLock);
-
-        bool all_ok = true;
-        if (m_hasQwordRead) {
-            uint64_t* dst = reinterpret_cast<uint64_t*>(out);
-            for (int i = 0; i < 512; i++) {
-                if (!WdtReadQword(pagePA + (uint64_t)i * 8, dst[i])) {
-                    all_ok = false;
-                    break;
-                }
-            }
-        } else {
-            uint32_t* dst = reinterpret_cast<uint32_t*>(out);
-            for (int i = 0; i < 1024; i++) {
-                if (!WdtReadDword(pagePA + (uint64_t)i * 4, dst[i])) {
-                    all_ok = false;
-                    break;
-                }
-            }
-        }
-
-        if (!all_ok) {
+        bool ok = SivReadPhys(pagePA, out, 4096);
+        if (!ok) {
             static bool s_logged = false;
             if (!s_logged) {
                 s_logged = true;
-                printf(skCrypt("[SysMonitor] WDT read failed: err=%lu (PA=0x%llX)\n"),
+                printf(skCrypt("[SysMonitor] SIV read failed: err=%lu (PA=0x%llX)\n"),
                        GetLastError(), (unsigned long long)pagePA);
             }
             m_badPAs[m_badPaHead] = pagePA;
             m_badPaHead = (m_badPaHead + 1) % kBadPaCount;
         }
-
         LeaveCriticalSection(&m_ioctlLock);
-        return all_ok;
+        return ok;
     }
 
     // Compatibility shim — callers still use the old NalReadPage name.
     bool NalReadPage(uint64_t pagePA, uint8_t out[4096]) {
-        return WdtReadPage(pagePA, out);
-    }
-
-    // Optional: single-DWORD physical write via IOCTL 0x9C41240C.
-    // Kept for completeness; the read-only ESP path never uses this.
-    bool WdtWriteDword(uint64_t physAddr, uint32_t value) {
-        HANDLE hUse = INVALID_HANDLE_VALUE;
-        bool   ownedOpen = false;
-        if (m_idleMode) {
-            EnterCriticalSection(&m_physLock);
-            if (!IsOpen()) {
-                m_hDevice = CreateFileA(skCrypt("\\\\.\\__WDT__"),
-                                        GENERIC_READ | GENERIC_WRITE,
-                                        FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                        nullptr, OPEN_EXISTING,
-                                        FILE_ATTRIBUTE_NORMAL, nullptr);
-                ownedOpen = (m_hDevice != INVALID_HANDLE_VALUE);
-            }
-            hUse = m_hDevice;
-            LeaveCriticalSection(&m_physLock);
-            if (hUse == INVALID_HANDLE_VALUE) return false;
-        } else {
-            hUse = m_hDevice;
-        }
-
-        WdtWriteReq req{ physAddr, value };
-        DWORD returned = 0;
-        BOOL  ok = DeviceIoControl(hUse, IOCTL_WDT_WRITE_DWORD,
-                                   &req, sizeof(req),
-                                   nullptr, 0,
-                                   &returned, nullptr);
-
-        if (ownedOpen) {
-            EnterCriticalSection(&m_physLock);
-            CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE;
-            LeaveCriticalSection(&m_physLock);
-        }
-        return ok != FALSE;
+        return SivReadPage(pagePA, out);
     }
 
     uint64_t ReadPhys64(uint64_t physAddr) {
@@ -1382,17 +1499,16 @@ private:
         return s;
     }
 
-    // 512 × 4KB = 2 MB of cached physical pages. Small enough to fit in L2
-    // on any modern CPU, big enough to cover the working set of Cache::Refresh
-    // (client.dll data pages, entity pawns, bone matrices, view matrix)
-    // across many frames without thrashing. Was 16 — that was one order of
-    // magnitude too small for the WDT-driver era where a cold page fill
-    // costs 1024 IOCTLs.
-    static constexpr int kPhysPageCacheN = 512;
+    // 128 × 4KB = 512 KB of cached physical pages. WDTKernel needed 512 slots
+    // because a cold page fill cost 512+ IOCTLs — thrash on eviction was
+    // catastrophic. SIV fills a page in ONE IOCTL, so the driver-side
+    // mapping cache and this LRU together already dominate the WDT-era 512
+    // configuration; 128 fits comfortably in a Zen3 L2 (5700x has 512 KB
+    // per core) with room to spare and cuts steady-state RAM by 1.5 MB.
+    static constexpr int kPhysPageCacheN = 128;
     struct PhysPageEntry { uint64_t pa; uint8_t data[4096]; };
 
     bool            m_idleMode         = false;
-    bool            m_hasQwordRead     = false;
     HANDLE          m_hDevice          = INVALID_HANDLE_VALUE;
     uint64_t        m_kernelBase       = 0;
     uint64_t        m_kernelPA         = 0;
@@ -1413,4 +1529,25 @@ private:
     static constexpr int kBadPaCount = 64;
     uint64_t             m_badPAs[kBadPaCount] = {};
     int                  m_badPaHead = 0;
+
+    // Circuit-breaker + rate-limited-log state for SivReadPhys.
+    //   kIoFailStreakBreaker: consecutive pipe-death failures (HandleStale
+    //     / HandleFailed / IoctlDenied per IsPipeDeath()) before we latch
+    //     broken and start fast-failing subsequent reads. Per-PA rejections
+    //     never accumulate here — they reset the streak — so CR3 brute-
+    //     force and PT scans that legitimately hit driver-refused reserved-
+    //     memory PAs cannot false-trip the breaker. 32 is generous slack for
+    //     a genuine anti-cheat teardown or driver unload without hiding a
+    //     real death for long.
+    //   kIoFailLogCap: max prints per SivFail code per run. Chosen so
+    //     first-time diagnostics show up clearly (10 lines is enough to
+    //     see PA patterns) but a repeat problem doesn't drown the console.
+    //   kFailLogSlots: covers every current SivFail enumerator; increase
+    //     alongside the enum if new codes are added.
+    static constexpr int  kIoFailStreakBreaker = 32;
+    static constexpr int  kIoFailLogCap        = 10;
+    static constexpr int  kFailLogSlots        = 9;
+    std::atomic<int>      m_ioFailStreak       {0};
+    std::atomic<bool>     m_ioBroken           {false};
+    std::atomic<int>      m_failLogCounts[kFailLogSlots] {};
 };

