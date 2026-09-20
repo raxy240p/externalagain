@@ -12,58 +12,58 @@
 #include <lazy_importer/lazy_importer.hpp>
 #include "core/anti_debug/AntiDebug.hpp"
 
-// WDTKernel.sys (Dell Watchdog Timer Kernel Driver v1.4.1.0, WHQL-signed).
-// SHA256: 0E27BEC347CA0050C455467BD8D774175C503B8AA1AF3411E94966F7DC6B28B7
+// SIVX64.sys (System Information Viewer X64 driver, Ray Hinchliffe, v5.85).
+// SHA256: 33903E8FA9F0A2ACAA4784D645E309B0BD780693824B6C2C5FEF257238C77478
+// Signer: Microsoft Windows Hardware Compatibility Publisher (WHCP).
 // Not on Microsoft's HVCI vulnerable-driver blocklist as of Win11 24H2/25H2.
+// Confirmed to load under HVCI.
 //
-// Device: \\.\__WDT__
+// Device: \Device\SIVDRIVER  →  \DosDevices\SIVDRIVER  →  user-mode "\\.\SIVDRIVER"
 //
-// IOCTL scheme — direct physical-memory access, no MmMapIoSpace state
-// leaks across calls (each IOCTL maps, reads/writes, and unmaps within
-// one kernel entry). Concurrent-safe from user side.
+// Import-scan evasion: MmMapIoSpace / MmMapIoSpaceEx are resolved at DriverEntry
+// via MmGetSystemRoutineAddress (they live in .rdata as wide UNICODE_STRING
+// arguments only, not in the PE import table). Static import scanners see
+// only MmUnmapIoSpace + MmGetSystemRoutineAddress — the "read" primitive is
+// invisible to naïve fingerprinting.
 //
-//   0x9C412400  Read  physical DWORD:  in=uint64_t PA,               out=uint32_t
-//   0x9C412404  Read  physical QWORD:  in=uint64_t PA,               out=uint64_t
-//   0x9C41240C  Write physical DWORD:  in=uint64_t PA + uint32_t val, out=none
-//   0x9C412410  Write physical QWORD:  in=uint64_t PA + uint64_t val, out=none
+// IOCTL surface (dispatch on raw IoControlCode, no CTL_CODE wrapper):
+//   0x08  IOCTL_SIV_RDMSR             (RDMSR)
+//   0x0C  IOCTL_SIV_WRMSR             (WRMSR, whitelisted MSR IDs only)
+//   0x10  IOCTL_SIV_PHY_MEMORY        ← we use this: arbitrary-length phys R
+//   0x13  IOCTL_SIV_BAR_MEMORY        (PCI BAR I/O)
+//   0x14  IOCTL_SIV_BIG_MEMORY        (scatter-gather phys R/W, 0x48+ descriptor)
+//   … others (KCS, PCIBUS, SMBUS, disk, ACPI, mutant-owner) not used here
 //
-// The QWORD variants were verified present in the dispatch table at
-// offset 0x2936 of WDTKernel.sys v1.4.1.0. Using them halves IOCTL
-// count for 8-byte reads (pointer chain walks, PTE reads).
+// IOCTL 0x10 primitive (verified against SIVX64.sys dispatch @ 0x22164):
+//   METHOD_BUFFERED. InputBuffer[0..7] = uint64 physical address.
+//   InputLength ∈ [4, 0x40000] sets the map/copy size. OutputLength ≥ 8.
+//   Driver: MmMapIoSpace(PA, InputLength) → dword-copy into SystemBuffer.
+//   Kernel then copies min(InputLength, OutputLength) bytes of SystemBuffer
+//   back to the caller's OutputBuffer — so OutputBuffer receives the read.
+//   The driver keeps an internal LRU of mappings, so repeated reads of the
+//   same PA range skip MmMapIoSpace/MmUnmapIoSpace on the kernel side too.
 //
-// Trade-off vs. the previous driver's page-at-a-time memcpy: cold-cache
-// page fills still cost 512 IOCTLs (via QWORD) or 1024 (via DWORD).
-// The phys-page LRU in PhysRead() amortises this across re-reads of
-// the same page (the hot path after game state stabilises), and the
-// small-read fast path avoids page fills for reads ≤ 256 bytes.
-#define IOCTL_WDT_READ_DWORD            0x9C412400u
-#define IOCTL_WDT_READ_QWORD            0x9C412404u
-#define IOCTL_WDT_WRITE_DWORD           0x9C41240Cu
-#define IOCTL_WDT_WRITE_QWORD           0x9C412410u
+// One IOCTL per page (or per bulk-read up to 256 KB) vs. WDTKernel's 512
+// QWORD IOCTLs per page — ~500× IOCTL reduction on cold-cache path.
+#define IOCTL_SIV_PHY_MEMORY            0x10u
+
+// Minimum InputBuffer size to safely hold the 8-byte phys address.
+// InputLength < 8 would leave the upper bytes of the PA as uninitialised
+// SystemBuffer contents (kernel pool), so the driver would map junk.
+#define SIV_MIN_READ                    8u
+// Driver's absolute per-IOCTL size ceiling (from `cmp [r13-4], 0x3FFFC`
+// in the dispatch — InputLength - 4 ≤ 0x3FFFC → InputLength ≤ 0x40000).
+#define SIV_MAX_READ                    0x40000u
 
 #pragma pack(push, 1)
-struct WdtReadReq {
-    uint64_t phys_addr;                 // IN
+// The complete SIV_PHY_MEMORY input in simple-read mode is just a physical
+// address followed by padding; the padding gets overwritten in place by
+// the kernel side and returned as the read payload. Any Input/OutputBuffer
+// of the same length ≥ 8 works — we just cast the head to this.
+struct SivPhyMemReq {
+    uint64_t phys_addr;                 // IN — 8 bytes at offset 0
 };
-struct WdtReadResp {
-    uint32_t value;                     // OUT (DWORD variant)
-};
-struct WdtReadResp64 {
-    uint64_t value;                     // OUT (QWORD variant)
-};
-struct WdtWriteReq {
-    uint64_t phys_addr;                 // IN
-    uint32_t value;                     // IN (DWORD variant)
-};
-struct WdtWriteReq64 {
-    uint64_t phys_addr;                 // IN
-    uint64_t value;                     // IN (QWORD variant)
-};
-static_assert(sizeof(WdtReadReq)     == 0x08, "read req size");
-static_assert(sizeof(WdtReadResp)    == 0x04, "read resp size");
-static_assert(sizeof(WdtReadResp64)  == 0x08, "read64 resp size");
-static_assert(sizeof(WdtWriteReq)    == 0x0C, "write req size");
-static_assert(sizeof(WdtWriteReq64)  == 0x10, "write64 req size");
+static_assert(sizeof(SivPhyMemReq) == 0x08, "SIV PHY_MEMORY header size");
 #pragma pack(pop)
 
 class WinDrvReader {
@@ -77,18 +77,17 @@ public:
 
     bool Open() {
         if (IsOpen()) return true;
-        DBG_PRINT("[wdt] Opening device...\n");
-        // Try each (path, access) pair in the order they've historically worked
-        // for KMDF-style Nal-family drivers. First success wins.
+        DBG_PRINT("[siv] Opening device...\n");
+        // Try each (path, access) pair. First success wins.
         //   - GENERIC_READ|WRITE:       normal admin access
         //   - GENERIC_READ:             device with read-only DACL
-        //   - SYNCHRONIZE / 0:          IOCTL 0x9C412400 declares FILE_ANY_ACCESS,
+        //   - SYNCHRONIZE / 0:          IOCTL 0x10 declares FILE_ANY_ACCESS,
         //                               so no read/write rights are strictly needed
         //   - GLOBALROOT / global path: session-isolation fallback
         // Also retries ERROR_FILE_NOT_FOUND (symlink publish race) up to 10x.
         struct Attempt { const char* path; DWORD access; };
-        static const char* kPathA = skCrypt("\\\\.\\__WDT__");
-        static const char* kPathB = skCrypt("\\\\.\\GLOBALROOT\\Device\\__WDT__");
+        static const char* kPathA = skCrypt("\\\\.\\SIVDRIVER");
+        static const char* kPathB = skCrypt("\\\\.\\GLOBALROOT\\Device\\SIVDRIVER");
         Attempt attempts[] = {
             { kPathA, GENERIC_READ | GENERIC_WRITE },
             { kPathA, GENERIC_READ                 },
@@ -113,42 +112,30 @@ public:
             Sleep(100);
         }
         if (m_hDevice == INVALID_HANDLE_VALUE) {
-            DBG_PRINT("[wdt] Failed to open device: err=%lu\n", lastErr);
-            if (lastErr == 2) DBG_PRINT("[wdt]   (device not found -- driver not loaded)\n");
-            else if (lastErr == 5) DBG_PRINT("[wdt]   (access denied on every access mode -- DACL blocks user-mode entirely)\n");
+            DBG_PRINT("[siv] Failed to open device: err=%lu\n", lastErr);
+            if (lastErr == 2) DBG_PRINT("[siv]   (device not found -- driver not loaded)\n");
+            else if (lastErr == 5) DBG_PRINT("[siv]   (access denied on every access mode -- DACL blocks user-mode entirely)\n");
             return false;
         }
-        DBG_PRINT("[wdt] Device opened: handle=0x%p\n", (void*)m_hDevice);
-        // Probe both IOCTLs at PA=0x1000 (real RAM, always mapped). Confirms
-        // driver dispatch and populates the QWORD-capability flag.
-        uint32_t probeD = 0;
-        uint64_t probeQ = 0;
-        bool dwOk = WdtReadDword(0x1000, probeD);
-        bool qwOk = WdtReadQword(0x1000, probeQ);
+        DBG_PRINT("[siv] Device opened: handle=0x%p\n", (void*)m_hDevice);
+        // Probe IOCTL 0x10 at PA=0x1000 (real RAM, always mapped) with an
+        // 8-byte read. One primitive, no D/Q divergence to check.
+        uint64_t probe = 0;
+        bool ok = SivReadPhys(0x1000, &probe, sizeof(probe));
 
-        // Consistency check: if both IOCTLs claim success, their low 32
-        // bits must match (same physical DWORD). If they don't, the
-        // "QWORD" IOCTL actually does something else on this driver
-        // build — treat it as unsupported to avoid corrupt reads.
-        if (dwOk && qwOk && (uint32_t)probeQ != probeD) {
-            printf(skCrypt("[SysMonitor] WDT QWORD mismatch: DWORD=0x%08X  QWORD-low=0x%08X — QWORD disabled\n"),
-                   probeD, (uint32_t)probeQ);
-            qwOk = false;
-        }
-        m_hasQwordRead = qwOk;
-
-        if (!dwOk && !qwOk) {
-            printf(skCrypt("[SysMonitor] WDT probe FAILED (err=%lu) -- driver up but IOCTLs blocked\n"), GetLastError());
+        if (!ok) {
+            printf(skCrypt("[SysMonitor] SIV probe FAILED (err=%lu) -- driver up but IOCTL 0x10 blocked\n"),
+                   GetLastError());
             // Fail Open() so Engine::Init doesn't proceed with a driver
-            // whose read path is broken. Previously we returned true here
-            // and downstream code cascaded through failed CR3 resolution,
-            // module discovery, etc., with no clear diagnostic.
+            // whose read path is broken. Downstream code cascading through
+            // failed CR3 resolution / module discovery gives no clear
+            // diagnostic; failing here does.
             CloseHandle(m_hDevice);
             m_hDevice = INVALID_HANDLE_VALUE;
             return false;
         }
-        printf(skCrypt("[SysMonitor] WDT probe OK  DWORD=0x%08X  QWORD=0x%016llX (qw=%s)\n"),
-               probeD, (unsigned long long)probeQ, qwOk ? "on" : "off");
+        printf(skCrypt("[SysMonitor] SIV probe OK  PA=0x1000 -> 0x%016llX\n"),
+               (unsigned long long)probe);
         return true;
     }
 
@@ -787,34 +774,33 @@ public:
     }
 
     // Direct physical read — bypasses the page cache.
-    // Uses QWORD IOCTLs where the address+size is 8-byte-aligned (the
-    // common case for pointer chain walks and PT reads); falls back to
-    // DWORD IOCTLs for unaligned head/tail bytes.
+    // Under SIV, one IOCTL handles the whole request in a single MmMapIoSpace
+    // regardless of alignment or size (up to SIV_MAX_READ). The driver's
+    // internal mapping cache also amortises MmMapIoSpace on the kernel side,
+    // so consecutive reads of the same page group stay cheap.
+    // Sizes above the ceiling are split into ≤ SIV_MAX_READ chunks; sizes
+    // below SIV_MIN_READ pad up to the min via a temporary and copy.
     bool ReadPhysDirect(uint64_t physAddr, void* buffer, size_t size) {
         uint8_t* dst = (uint8_t*)buffer;
         size_t done = 0;
         while (done < size) {
-            uint64_t curPA = physAddr + done;
             size_t remain = size - done;
+            size_t chunk  = (std::min)(remain, (size_t)SIV_MAX_READ);
 
-            // Aligned 8-byte fast path — one IOCTL, no bit-shuffling.
-            // Only used when the driver confirmed QWORD support at Open().
-            if (m_hasQwordRead && (curPA & 7ULL) == 0 && remain >= 8) {
-                uint64_t val = 0;
-                if (!WdtReadQword(curPA, val)) return false;
-                memcpy(dst + done, &val, 8);
-                done += 8;
+            if (chunk >= SIV_MIN_READ) {
+                if (!SivReadPhys(physAddr + done, dst + done, chunk))
+                    return false;
+                done += chunk;
                 continue;
             }
 
-            // Otherwise: read the covering DWORD and copy the needed bytes.
-            uint64_t dwordPA = curPA & ~3ULL;
-            size_t   offset  = curPA - dwordPA;
-            size_t   chunk   = (std::min)(remain, (size_t)(4 - offset));
-
-            uint32_t val = 0;
-            if (!WdtReadDword(dwordPA, val)) return false;
-            memcpy(dst + done, ((uint8_t*)&val) + offset, chunk);
+            // Sub-min request: read SIV_MIN_READ into a stack buffer and
+            // copy the leading `chunk` bytes. IOCTL cost is per-call, not
+            // per-byte, so a small overshoot is free.
+            uint8_t tmp[SIV_MIN_READ] = {};
+            if (!SivReadPhys(physAddr + done, tmp, sizeof(tmp)))
+                return false;
+            memcpy(dst + done, tmp, chunk);
             done += chunk;
         }
         return true;
@@ -826,14 +812,14 @@ public:
         if (!IsSafeToMap(physAddr) || !IsSafeToMap(physAddr + size - 1))
             return false;
 
-        // Threshold: reads smaller than this skip the page cache entirely
-        // and issue direct DWORD IOCTLs. Filling a 4KB page costs 1024
-        // IOCTLs vs. size/4 for a direct read. Break-even is ~4KB, but the
-        // page cache also amortises repeated reads of the same page — so
-        // the useful threshold is lower. 256B is a good middle: pointer
-        // chain walks, entity field reads, and view-matrix reads all fit
-        // in the fast path; only larger structs (bones, big buffers) go
-        // through the cache.
+        // Threshold: total requests ≤ this skip the page-cache slot fill and
+        // just issue one IOCTL for the exact bytes needed. Under SIV, both
+        // paths cost one IOCTL — the threshold is about page-cache economics,
+        // not IOCTL count: 4 KB of RAM per slot is only worth spending on
+        // pages likely to be re-read (repeated pointer chain walks, entity
+        // struct re-touches, view-matrix reads). One-off small reads (single
+        // fields, header probes) shouldn't evict a hot page slot for a
+        // page that'll never be read again. 256 B stays a good middle.
         constexpr size_t kFastPathBytes = 256;
 
         uint8_t* dst = (uint8_t*)buffer;
@@ -858,9 +844,9 @@ public:
 
             if (!hit) {
                 if (size <= kFastPathBytes) {
-                    // Small read: direct DWORD IOCTLs for this chunk only.
-                    // The page isn't cached afterwards — it wasn't worth 1024
-                    // IOCTLs just to satisfy an 8-byte fetch on this page.
+                    // Small read: one IOCTL for exactly `chunk` bytes.
+                    // The page isn't slotted in the LRU afterwards — a
+                    // one-off small read shouldn't evict a hot page.
                     if (!ReadPhysDirect(physAddr + done, dst + done, chunk))
                         return false;
                 } else {
@@ -893,15 +879,28 @@ private:
     WinDrvReader(const WinDrvReader&) = delete;
     WinDrvReader& operator=(const WinDrvReader&) = delete;
 
-    // Single-QWORD physical read via WDTKernel IOCTL 0x9C412404.
-    // Halves the IOCTL count for 8-byte reads vs. two DWORD calls.
-    bool WdtReadQword(uint64_t physAddr, uint64_t& out_val) {
+    // Single arbitrary-length physical read via SIV IOCTL 0x10 (PHY_MEMORY).
+    // METHOD_BUFFERED: kernel copies the caller's InputBuffer into a
+    // SystemBuffer, driver reads PA into that same SystemBuffer, kernel
+    // copies min(InputLength, OutputLength) bytes back to OutputBuffer.
+    // We use one contiguous buffer where the leading 8 bytes carry the PA
+    // and the buffer receives the read on return.
+    //
+    // Preconditions (caller-enforced upstream by PhysRead / ReadPhysDirect):
+    //   - `size` ∈ [SIV_MIN_READ, SIV_MAX_READ]
+    //   - `out`  is user-mode writable for `size` bytes
+    //
+    // Idle-mode retains the "reopen per call, close after" pattern so the
+    // process handle table shows no live \\.\SIVDRIVER handle between scans.
+    bool SivReadPhys(uint64_t physAddr, void* out, size_t size) {
+        if (!out || size < SIV_MIN_READ || size > SIV_MAX_READ) return false;
+
         HANDLE hUse = INVALID_HANDLE_VALUE;
         bool   ownedOpen = false;
         if (m_idleMode) {
             EnterCriticalSection(&m_physLock);
             if (!IsOpen()) {
-                m_hDevice = CreateFileA(skCrypt("\\\\.\\__WDT__"),
+                m_hDevice = CreateFileA(skCrypt("\\\\.\\SIVDRIVER"),
                                         GENERIC_READ | GENERIC_WRITE,
                                         FILE_SHARE_READ | FILE_SHARE_WRITE,
                                         nullptr, OPEN_EXISTING,
@@ -915,12 +914,16 @@ private:
             hUse = m_hDevice;
         }
 
-        WdtReadReq     req{ physAddr };
-        WdtReadResp64  resp{ 0 };
+        // Stamp the 8-byte PA header at the head of the caller's buffer.
+        // The driver will overwrite these same 8 bytes with the first 8
+        // bytes of the read payload — exactly the semantics we want.
+        SivPhyMemReq* hdr = reinterpret_cast<SivPhyMemReq*>(out);
+        hdr->phys_addr = physAddr;
+
         DWORD returned = 0;
-        BOOL  ok = DeviceIoControl(hUse, IOCTL_WDT_READ_QWORD,
-                                   &req,  sizeof(req),
-                                   &resp, sizeof(resp),
+        BOOL  ok = DeviceIoControl(hUse, IOCTL_SIV_PHY_MEMORY,
+                                   out, (DWORD)size,   // Input  (PA header)
+                                   out, (DWORD)size,   // Output (read data)
                                    &returned, nullptr);
 
         if (ownedOpen) {
@@ -929,145 +932,43 @@ private:
             LeaveCriticalSection(&m_physLock);
         }
 
-        if (!ok || returned != sizeof(resp)) return false;
-        out_val = resp.value;
-        return true;
+        // The driver copies `size` bytes back — anything short is a failure.
+        return ok != FALSE && returned == (DWORD)size;
     }
 
-    // Single-DWORD physical read via WDTKernel IOCTL 0x9C412400.
-    // Each call is one full IOCTL — map/read/unmap is done atomically
-    // inside the driver, so we never have overlapping mapping state.
-    bool WdtReadDword(uint64_t physAddr, uint32_t& out_val) {
-        HANDLE hUse = INVALID_HANDLE_VALUE;
-        bool   ownedOpen = false;
-        if (m_idleMode) {
-            EnterCriticalSection(&m_physLock);
-            if (!IsOpen()) {
-                m_hDevice = CreateFileA(skCrypt("\\\\.\\__WDT__"),
-                                        GENERIC_READ | GENERIC_WRITE,
-                                        FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                        nullptr, OPEN_EXISTING,
-                                        FILE_ATTRIBUTE_NORMAL, nullptr);
-                ownedOpen = (m_hDevice != INVALID_HANDLE_VALUE);
-            }
-            hUse = m_hDevice;
-            LeaveCriticalSection(&m_physLock);
-            if (hUse == INVALID_HANDLE_VALUE) return false;
-        } else {
-            hUse = m_hDevice;
-        }
-
-        WdtReadReq  req{ physAddr };
-        WdtReadResp resp{ 0 };
-        DWORD returned = 0;
-        BOOL  ok = DeviceIoControl(hUse, IOCTL_WDT_READ_DWORD,
-                                   &req,  sizeof(req),
-                                   &resp, sizeof(resp),
-                                   &returned, nullptr);
-
-        if (ownedOpen) {
-            EnterCriticalSection(&m_physLock);
-            CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE;
-            LeaveCriticalSection(&m_physLock);
-        }
-
-        if (!ok || returned != sizeof(resp)) return false;
-        out_val = resp.value;
-        return true;
-    }
-
-    // Fills a 4KB physical page by issuing 512 sequential QWORD reads
-    // (was 1024 DWORD reads before the QWORD IOCTL was wired up).
-    // Cold path only — the phys-page LRU in PhysRead() means this runs
-    // on first touch of a page; after warmup, most reads hit cache.
-    bool WdtReadPage(uint64_t pagePA, uint8_t out[4096]) {
+    // Fills a 4KB physical page in a SINGLE IOCTL. WDTKernel needed 512
+    // (QWORD) or 1024 (DWORD); SIV maps + copies the whole page at once.
+    bool SivReadPage(uint64_t pagePA, uint8_t out[4096]) {
         pagePA &= ~0xFFFULL;
         if (!out || reinterpret_cast<uintptr_t>(out) < 0x10000ULL) return false;
 
-        // PA blacklist: skip pages that have failed before. Each entry
-        // costs one comparison; miss once, skip forever.
+        // PA blacklist: skip pages that have failed before. Miss once, skip forever.
         for (int i = 0; i < kBadPaCount; i++)
             if (m_badPAs[i] && m_badPAs[i] == pagePA) return false;
 
         // Serialise so one thread's stream isn't interleaved with another's.
-        // Not strictly required for correctness (each IOCTL is self-contained)
-        // but keeps driver-side cache locality clean.
+        // Not strictly required for correctness (each IOCTL is self-contained
+        // and the SIV driver has its own mapping-cache mutex) but keeps
+        // driver-side cache locality clean.
         EnterCriticalSection(&m_ioctlLock);
-
-        bool all_ok = true;
-        if (m_hasQwordRead) {
-            uint64_t* dst = reinterpret_cast<uint64_t*>(out);
-            for (int i = 0; i < 512; i++) {
-                if (!WdtReadQword(pagePA + (uint64_t)i * 8, dst[i])) {
-                    all_ok = false;
-                    break;
-                }
-            }
-        } else {
-            uint32_t* dst = reinterpret_cast<uint32_t*>(out);
-            for (int i = 0; i < 1024; i++) {
-                if (!WdtReadDword(pagePA + (uint64_t)i * 4, dst[i])) {
-                    all_ok = false;
-                    break;
-                }
-            }
-        }
-
-        if (!all_ok) {
+        bool ok = SivReadPhys(pagePA, out, 4096);
+        if (!ok) {
             static bool s_logged = false;
             if (!s_logged) {
                 s_logged = true;
-                printf(skCrypt("[SysMonitor] WDT read failed: err=%lu (PA=0x%llX)\n"),
+                printf(skCrypt("[SysMonitor] SIV read failed: err=%lu (PA=0x%llX)\n"),
                        GetLastError(), (unsigned long long)pagePA);
             }
             m_badPAs[m_badPaHead] = pagePA;
             m_badPaHead = (m_badPaHead + 1) % kBadPaCount;
         }
-
         LeaveCriticalSection(&m_ioctlLock);
-        return all_ok;
+        return ok;
     }
 
     // Compatibility shim — callers still use the old NalReadPage name.
     bool NalReadPage(uint64_t pagePA, uint8_t out[4096]) {
-        return WdtReadPage(pagePA, out);
-    }
-
-    // Optional: single-DWORD physical write via IOCTL 0x9C41240C.
-    // Kept for completeness; the read-only ESP path never uses this.
-    bool WdtWriteDword(uint64_t physAddr, uint32_t value) {
-        HANDLE hUse = INVALID_HANDLE_VALUE;
-        bool   ownedOpen = false;
-        if (m_idleMode) {
-            EnterCriticalSection(&m_physLock);
-            if (!IsOpen()) {
-                m_hDevice = CreateFileA(skCrypt("\\\\.\\__WDT__"),
-                                        GENERIC_READ | GENERIC_WRITE,
-                                        FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                        nullptr, OPEN_EXISTING,
-                                        FILE_ATTRIBUTE_NORMAL, nullptr);
-                ownedOpen = (m_hDevice != INVALID_HANDLE_VALUE);
-            }
-            hUse = m_hDevice;
-            LeaveCriticalSection(&m_physLock);
-            if (hUse == INVALID_HANDLE_VALUE) return false;
-        } else {
-            hUse = m_hDevice;
-        }
-
-        WdtWriteReq req{ physAddr, value };
-        DWORD returned = 0;
-        BOOL  ok = DeviceIoControl(hUse, IOCTL_WDT_WRITE_DWORD,
-                                   &req, sizeof(req),
-                                   nullptr, 0,
-                                   &returned, nullptr);
-
-        if (ownedOpen) {
-            EnterCriticalSection(&m_physLock);
-            CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE;
-            LeaveCriticalSection(&m_physLock);
-        }
-        return ok != FALSE;
+        return SivReadPage(pagePA, out);
     }
 
     uint64_t ReadPhys64(uint64_t physAddr) {
@@ -1382,17 +1283,16 @@ private:
         return s;
     }
 
-    // 512 × 4KB = 2 MB of cached physical pages. Small enough to fit in L2
-    // on any modern CPU, big enough to cover the working set of Cache::Refresh
-    // (client.dll data pages, entity pawns, bone matrices, view matrix)
-    // across many frames without thrashing. Was 16 — that was one order of
-    // magnitude too small for the WDT-driver era where a cold page fill
-    // costs 1024 IOCTLs.
-    static constexpr int kPhysPageCacheN = 512;
+    // 128 × 4KB = 512 KB of cached physical pages. WDTKernel needed 512 slots
+    // because a cold page fill cost 512+ IOCTLs — thrash on eviction was
+    // catastrophic. SIV fills a page in ONE IOCTL, so the driver-side
+    // mapping cache and this LRU together already dominate the WDT-era 512
+    // configuration; 128 fits comfortably in a Zen3 L2 (5700x has 512 KB
+    // per core) with room to spare and cuts steady-state RAM by 1.5 MB.
+    static constexpr int kPhysPageCacheN = 128;
     struct PhysPageEntry { uint64_t pa; uint8_t data[4096]; };
 
     bool            m_idleMode         = false;
-    bool            m_hasQwordRead     = false;
     HANDLE          m_hDevice          = INVALID_HANDLE_VALUE;
     uint64_t        m_kernelBase       = 0;
     uint64_t        m_kernelPA         = 0;

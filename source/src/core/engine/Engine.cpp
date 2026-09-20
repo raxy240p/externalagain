@@ -40,7 +40,7 @@ bool Engine::InitImpl() {
         printf(skCrypt("[SysMonitor] Failed to open device\n"));
         return false;
     }
-    printf(skCrypt("[SysMonitor] WDT driver ready\n"));
+    printf(skCrypt("[SysMonitor] SIV driver ready\n"));
 
     process = std::make_shared<pProcess>();
 
