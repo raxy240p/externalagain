@@ -952,6 +952,21 @@ private:
         }
     }
 
+    // Only pipe-death signals count toward the circuit breaker — i.e. failures
+    // where "the driver connection itself is broken" is a strictly better
+    // hypothesis than "this particular PA is unmappable". A stale handle,
+    // a refused reopen, or an access denial appearing mid-session means the
+    // whole path is gone (anti-cheat teardown, unload, DACL change). Per-PA
+    // rejections do NOT count — BruteForceCr3 and BulkPTScan legitimately hit
+    // dozens or hundreds of driver-refused PAs during scanning; letting those
+    // trip the breaker would masquerade "healthy driver, some reserved-memory
+    // PAs" as "driver dead" and false-negative Engine::Init at CR3 resolution.
+    static bool IsPipeDeath(SivFail cls) {
+        return cls == SivFail::HandleStale
+            || cls == SivFail::HandleFailed
+            || cls == SivFail::IoctlDenied;
+    }
+
     static const char* SivFailName(SivFail f) {
         switch (f) {
             case SivFail::Ok:            return "ok";
@@ -1118,12 +1133,21 @@ private:
         }
 
         NoteSivFail(cls, physAddr, (DWORD)size, returned, GetLastError());
-        int streak = m_ioFailStreak.fetch_add(1, std::memory_order_acq_rel) + 1;
-        if (streak >= kIoFailStreakBreaker) {
-            if (!m_ioBroken.exchange(true, std::memory_order_acq_rel)) {
-                printf(skCrypt("[SysMonitor] SIV driver appears broken (%d consecutive IOCTL failures) — fast-failing further reads. Reset via WinDrvReader::Get().ResetIoBreaker() after re-loading.\n"),
-                       streak);
+
+        // Only pipe-death failures accumulate toward the breaker. A per-PA
+        // rejection RESETS the streak — it tells us the driver is alive and
+        // rejecting individual requests, which is exactly what we want it
+        // to do for reserved-memory regions during CR3 / PT scanning.
+        if (IsPipeDeath(cls)) {
+            int streak = m_ioFailStreak.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (streak >= kIoFailStreakBreaker) {
+                if (!m_ioBroken.exchange(true, std::memory_order_acq_rel)) {
+                    printf(skCrypt("[SysMonitor] SIV driver pipe dead (%d consecutive %s failures) — fast-failing further reads. Reset via WinDrvReader::Get().ResetIoBreaker() after re-loading.\n"),
+                           streak, SivFailName(cls));
+                }
             }
+        } else {
+            m_ioFailStreak.store(0, std::memory_order_release);
         }
         return false;
     }
@@ -1507,11 +1531,14 @@ private:
     int                  m_badPaHead = 0;
 
     // Circuit-breaker + rate-limited-log state for SivReadPhys.
-    //   kIoFailStreakBreaker: consecutive failures before we latch broken
-    //     and start fast-failing subsequent reads (avoids kernel round
-    //     trips against a driver that anti-cheat/HVCI has torn down mid-
-    //     session). 32 is enough tolerance for a run of transient
-    //     rejections without hiding a real driver death for long.
+    //   kIoFailStreakBreaker: consecutive pipe-death failures (HandleStale
+    //     / HandleFailed / IoctlDenied per IsPipeDeath()) before we latch
+    //     broken and start fast-failing subsequent reads. Per-PA rejections
+    //     never accumulate here — they reset the streak — so CR3 brute-
+    //     force and PT scans that legitimately hit driver-refused reserved-
+    //     memory PAs cannot false-trip the breaker. 32 is generous slack for
+    //     a genuine anti-cheat teardown or driver unload without hiding a
+    //     real death for long.
     //   kIoFailLogCap: max prints per SivFail code per run. Chosen so
     //     first-time diagnostics show up clearly (10 lines is enough to
     //     see PA patterns) but a repeat problem doesn't drown the console.
