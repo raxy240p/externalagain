@@ -8,6 +8,7 @@
 #include <cstring>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <skCrypter/skCrypter.hpp>
 #include <lazy_importer/lazy_importer.hpp>
 #include "core/anti_debug/AntiDebug.hpp"
@@ -54,6 +55,40 @@
 // Driver's absolute per-IOCTL size ceiling (from `cmp [r13-4], 0x3FFFC`
 // in the dispatch — InputLength - 4 ≤ 0x3FFFC → InputLength ≤ 0x40000).
 #define SIV_MAX_READ                    0x40000u
+
+// SIV IOCTL 0x10 return-contract summary (verified in disassembly):
+//
+//   Path                                     IoStatus.Status       Information
+//   Success (simple-copy)  @ 0x22449         STATUS_SUCCESS  (0)   = InputLength
+//   MmMapIoSpace fail      @ 0x22456         0xC00000E6            0 (entry default)
+//   Validation error       @ entry 0x21a1e   0xC0000004            0
+//   InputLength range fail @ 0x22171         (falls to default)    0
+//   OutputLength < 8       @ 0x22167         (falls to default)    0
+//
+// Win32 mapping seen at DeviceIoControl:
+//   STATUS_SUCCESS (0)                → returns TRUE, GetLastError undefined
+//   0xC000000D INVALID_PARAMETER      → FALSE, err = 87
+//   0xC0000004 INFO_LENGTH_MISMATCH   → FALSE, err = 24 (BAD_LENGTH)
+//   0xC00000E6                        → FALSE, err = 87 (or 1359 INTERNAL_ERROR)
+//   0xC0000010 INVALID_DEVICE_REQUEST → FALSE, err = 1 (INVALID_FUNCTION)
+//   0xC0000022 ACCESS_DENIED          → FALSE, err = 5
+//   Handle broken (session-teardown)  → FALSE, err = 6  (INVALID_HANDLE)
+//   Kernel low resources              → FALSE, err = 1450 (NO_SYSTEM_RESOURCES)
+//
+// SivReadPhys uses these codes to (a) classify a failure for logging, and
+// (b) decide whether to retry once (transient resource pressure only —
+// never retry a hard validation reject, which would just re-fault).
+enum class SivFail : uint8_t {
+    Ok            = 0,   // read succeeded
+    BadArgs       = 1,   // caller violated preconditions (size or ptr)
+    HandleFailed  = 2,   // idle-mode reopen returned INVALID_HANDLE_VALUE
+    IoctlDenied   = 3,   // err = 5, DACL blocks
+    IoctlRejected = 4,   // err = 87 / 24 / 1, driver refused params
+    HandleStale   = 5,   // err = 6, handle went bad (session race)
+    Transient     = 6,   // err = 1450, retryable
+    PartialReturn = 7,   // ok but returned != size (never seen — defensive)
+    UnknownError  = 8,   // any other Win32 err
+};
 
 #pragma pack(push, 1)
 // The complete SIV_PHY_MEMORY input in simple-read mode is just a physical
@@ -140,6 +175,24 @@ public:
     }
 
     void FlushDriverTable() {
+    }
+
+    // Clear the "driver is broken" circuit breaker latched by SivReadPhys
+    // after kIoFailStreakBreaker consecutive IOCTL failures. Call after
+    // re-loading the driver service (e.g. after RecoverDriverDevice) so
+    // subsequent reads are attempted again. Also resets the streak counter
+    // and per-code log budgets so a fresh incident logs from scratch.
+    void ResetIoBreaker() {
+        m_ioBroken.store(false, std::memory_order_release);
+        m_ioFailStreak.store(0, std::memory_order_release);
+        for (auto& c : m_failLogCounts) c.store(0, std::memory_order_release);
+    }
+
+    // True if the circuit breaker has latched. Callers that want to
+    // proactively fall back (or surface the state in a diagnostic UI)
+    // can poll this without stat-inspecting through a failing read.
+    bool IsIoBroken() const {
+        return m_ioBroken.load(std::memory_order_acquire);
     }
 
     // Idle mode: close the device handle when not reading, reopen per-IOCTL.
@@ -879,6 +932,64 @@ private:
     WinDrvReader(const WinDrvReader&) = delete;
     WinDrvReader& operator=(const WinDrvReader&) = delete;
 
+    // Classify a DeviceIoControl failure into a SivFail code from the Win32
+    // error and byte count. Keeps the retry decision and the log tagging
+    // out of the hot happy path.
+    static SivFail ClassifySivFail(BOOL ok, DWORD returned, DWORD requestedSize) {
+        if (ok != FALSE) {
+            if (returned == requestedSize) return SivFail::Ok;
+            return SivFail::PartialReturn;
+        }
+        DWORD err = GetLastError();
+        switch (err) {
+            case 5:                              return SivFail::IoctlDenied;
+            case 6:                              return SivFail::HandleStale;
+            case 1:
+            case 24:
+            case 87:                             return SivFail::IoctlRejected;
+            case 1450:                           return SivFail::Transient;
+            default:                             return SivFail::UnknownError;
+        }
+    }
+
+    static const char* SivFailName(SivFail f) {
+        switch (f) {
+            case SivFail::Ok:            return "ok";
+            case SivFail::BadArgs:       return "bad-args";
+            case SivFail::HandleFailed:  return "handle-failed";
+            case SivFail::IoctlDenied:   return "denied(err5)";
+            case SivFail::IoctlRejected: return "rejected(err1/24/87)";
+            case SivFail::HandleStale:   return "handle-stale(err6)";
+            case SivFail::Transient:     return "transient(err1450)";
+            case SivFail::PartialReturn: return "partial-return";
+            case SivFail::UnknownError:  return "unknown";
+        }
+        return "?";
+    }
+
+    // Rate-limited failure logger. Each SivFail code prints at most
+    // kIoFailLogCap times per run — a persistent problem stays visible in
+    // the console without turning into a scroll of spam. The message
+    // carries every bit the operator actually needs to root-cause: which
+    // PA / size we asked for, which class of failure the driver returned,
+    // and the raw Win32 err so it can be cross-referenced against MSDN.
+    void NoteSivFail(SivFail cls, uint64_t pa, DWORD size, DWORD returned, DWORD err) {
+        auto idx = static_cast<size_t>(cls);
+        if (idx >= (size_t)kFailLogSlots) return;
+        int n = m_failLogCounts[idx].fetch_add(1, std::memory_order_relaxed);
+        if (n < kIoFailLogCap) {
+            printf(skCrypt("[SysMonitor] SIV IOCTL 0x10 failed: %s  pa=0x%llX  size=%u  returned=%u  err=%lu\n"),
+                   SivFailName(cls),
+                   (unsigned long long)pa,
+                   (unsigned)size,
+                   (unsigned)returned,
+                   (unsigned long)err);
+        } else if (n == kIoFailLogCap) {
+            printf(skCrypt("[SysMonitor] SIV IOCTL 0x10: further %s failures suppressed (cap=%d)\n"),
+                   SivFailName(cls), kIoFailLogCap);
+        }
+    }
+
     // Single arbitrary-length physical read via SIV IOCTL 0x10 (PHY_MEMORY).
     // METHOD_BUFFERED: kernel copies the caller's InputBuffer into a
     // SystemBuffer, driver reads PA into that same SystemBuffer, kernel
@@ -892,8 +1003,27 @@ private:
     //
     // Idle-mode retains the "reopen per call, close after" pattern so the
     // process handle table shows no live \\.\SIVDRIVER handle between scans.
+    //
+    // Failure discipline:
+    //   - Transient (err=1450, no system resources) → retry ONCE with a
+    //     100 μs KeDelayExecutionThread-equivalent pause. Never retry a
+    //     hard validation reject — it will just re-fault deterministically.
+    //   - After kIoFailStreakBreaker consecutive failures, mark the driver
+    //     dead and fast-fail without hitting the IOCTL (avoids hammering
+    //     a driver that's been unloaded mid-session, e.g. by anti-cheat).
+    //   - Each distinct SivFail code logs at most kIoFailLogCap times so
+    //     a persistent problem stays visible without spamming the console.
     bool SivReadPhys(uint64_t physAddr, void* out, size_t size) {
-        if (!out || size < SIV_MIN_READ || size > SIV_MAX_READ) return false;
+        if (!out || size < SIV_MIN_READ || size > SIV_MAX_READ) {
+            NoteSivFail(SivFail::BadArgs, physAddr, (DWORD)size, 0, 0);
+            return false;
+        }
+
+        // Circuit breaker — if the driver has been failing every request
+        // for a while (session-teardown, unloaded, or anti-cheat scrubbed
+        // the device object) we don't want to keep waking the kernel just
+        // to fail. Callers see a clean bool false and stop cascading.
+        if (m_ioBroken.load(std::memory_order_acquire)) return false;
 
         HANDLE hUse = INVALID_HANDLE_VALUE;
         bool   ownedOpen = false;
@@ -909,7 +1039,10 @@ private:
             }
             hUse = m_hDevice;
             LeaveCriticalSection(&m_physLock);
-            if (hUse == INVALID_HANDLE_VALUE) return false;
+            if (hUse == INVALID_HANDLE_VALUE) {
+                NoteSivFail(SivFail::HandleFailed, physAddr, (DWORD)size, 0, GetLastError());
+                return false;
+            }
         } else {
             hUse = m_hDevice;
         }
@@ -951,14 +1084,48 @@ private:
                                    out, (DWORD)size,   // Output (read data)
                                    &returned, nullptr);
 
+        SivFail cls = ClassifySivFail(ok, returned, (DWORD)size);
+
+        // Single retry for transient resource pressure. The re-stamp of the
+        // PA is required because success/failure both consume the input
+        // header (kernel copies it to SystemBuffer once per call). Note we
+        // do NOT retry PartialReturn — a driver returning short bytes on a
+        // simple-copy IOCTL is a semantics violation, not resource pressure.
+        if (cls == SivFail::Transient) {
+            Sleep(0);                          // yield CPU, cheap
+            memcpy(out, &physAddr, sizeof(physAddr));
+            if (size > sizeof(physAddr)) {
+                size_t clear = (std::min)(size - sizeof(physAddr), (size_t)24);
+                memset(reinterpret_cast<uint8_t*>(out) + sizeof(physAddr), 0, clear);
+            }
+            returned = 0;
+            ok = DeviceIoControl(hUse, IOCTL_SIV_PHY_MEMORY,
+                                 out, (DWORD)size,
+                                 out, (DWORD)size,
+                                 &returned, nullptr);
+            cls = ClassifySivFail(ok, returned, (DWORD)size);
+        }
+
         if (ownedOpen) {
             EnterCriticalSection(&m_physLock);
             CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE;
             LeaveCriticalSection(&m_physLock);
         }
 
-        // The driver copies `size` bytes back — anything short is a failure.
-        return ok != FALSE && returned == (DWORD)size;
+        if (cls == SivFail::Ok) {
+            m_ioFailStreak.store(0, std::memory_order_release);
+            return true;
+        }
+
+        NoteSivFail(cls, physAddr, (DWORD)size, returned, GetLastError());
+        int streak = m_ioFailStreak.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (streak >= kIoFailStreakBreaker) {
+            if (!m_ioBroken.exchange(true, std::memory_order_acq_rel)) {
+                printf(skCrypt("[SysMonitor] SIV driver appears broken (%d consecutive IOCTL failures) — fast-failing further reads. Reset via WinDrvReader::Get().ResetIoBreaker() after re-loading.\n"),
+                       streak);
+            }
+        }
+        return false;
     }
 
     // Fills a 4KB physical page in a SINGLE IOCTL. WDTKernel needed 512
@@ -1338,4 +1505,22 @@ private:
     static constexpr int kBadPaCount = 64;
     uint64_t             m_badPAs[kBadPaCount] = {};
     int                  m_badPaHead = 0;
+
+    // Circuit-breaker + rate-limited-log state for SivReadPhys.
+    //   kIoFailStreakBreaker: consecutive failures before we latch broken
+    //     and start fast-failing subsequent reads (avoids kernel round
+    //     trips against a driver that anti-cheat/HVCI has torn down mid-
+    //     session). 32 is enough tolerance for a run of transient
+    //     rejections without hiding a real driver death for long.
+    //   kIoFailLogCap: max prints per SivFail code per run. Chosen so
+    //     first-time diagnostics show up clearly (10 lines is enough to
+    //     see PA patterns) but a repeat problem doesn't drown the console.
+    //   kFailLogSlots: covers every current SivFail enumerator; increase
+    //     alongside the enum if new codes are added.
+    static constexpr int  kIoFailStreakBreaker = 32;
+    static constexpr int  kIoFailLogCap        = 10;
+    static constexpr int  kFailLogSlots        = 9;
+    std::atomic<int>      m_ioFailStreak       {0};
+    std::atomic<bool>     m_ioBroken           {false};
+    std::atomic<int>      m_failLogCounts[kFailLogSlots] {};
 };
