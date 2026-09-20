@@ -78,24 +78,44 @@ public:
     bool Open() {
         if (IsOpen()) return true;
         DBG_PRINT("[wdt] Opening device...\n");
-        // Symlink race: StartService returns before I/O manager publishes
-        // \DosDevices\__WDT__ on some builds. Retry briefly on ERROR_FILE_NOT_FOUND.
+        // Try each (path, access) pair in the order they've historically worked
+        // for KMDF-style Nal-family drivers. First success wins.
+        //   - GENERIC_READ|WRITE:       normal admin access
+        //   - GENERIC_READ:             device with read-only DACL
+        //   - SYNCHRONIZE / 0:          IOCTL 0x9C412400 declares FILE_ANY_ACCESS,
+        //                               so no read/write rights are strictly needed
+        //   - GLOBALROOT / global path: session-isolation fallback
+        // Also retries ERROR_FILE_NOT_FOUND (symlink publish race) up to 10x.
+        struct Attempt { const char* path; DWORD access; };
+        static const char* kPathA = skCrypt("\\\\.\\__WDT__");
+        static const char* kPathB = skCrypt("\\\\.\\GLOBALROOT\\Device\\__WDT__");
+        Attempt attempts[] = {
+            { kPathA, GENERIC_READ | GENERIC_WRITE },
+            { kPathA, GENERIC_READ                 },
+            { kPathA, SYNCHRONIZE                  },
+            { kPathA, 0                            },
+            { kPathB, GENERIC_READ | GENERIC_WRITE },
+            { kPathB, 0                            },
+        };
         DWORD lastErr = 0;
-        for (int attempt = 0; attempt < 10; attempt++) {
-            m_hDevice = CreateFileA(skCrypt("\\\\.\\__WDT__"),
-                                    GENERIC_READ | GENERIC_WRITE,
-                                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                    nullptr, OPEN_EXISTING,
-                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+        for (int attempt = 0; attempt < 10 && m_hDevice == INVALID_HANDLE_VALUE; attempt++) {
+            for (auto& a : attempts) {
+                m_hDevice = CreateFileA(a.path,
+                                        a.access,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                        nullptr, OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (m_hDevice != INVALID_HANDLE_VALUE) break;
+                lastErr = GetLastError();
+            }
             if (m_hDevice != INVALID_HANDLE_VALUE) break;
-            lastErr = GetLastError();
             if (lastErr != 2) break;   // only retry the not-found race
             Sleep(100);
         }
         if (m_hDevice == INVALID_HANDLE_VALUE) {
             DBG_PRINT("[wdt] Failed to open device: err=%lu\n", lastErr);
             if (lastErr == 2) DBG_PRINT("[wdt]   (device not found -- driver not loaded)\n");
-            else if (lastErr == 5) DBG_PRINT("[wdt]   (access denied -- need admin or handle already held)\n");
+            else if (lastErr == 5) DBG_PRINT("[wdt]   (access denied on every access mode -- DACL blocks user-mode entirely)\n");
             return false;
         }
         DBG_PRINT("[wdt] Device opened: handle=0x%p\n", (void*)m_hDevice);

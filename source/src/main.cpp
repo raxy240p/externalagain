@@ -80,17 +80,249 @@ static bool IsProcessRunning(const char* exeName) {
     return found;
 }
 
-static bool IsDriverLoaded() {
-    auto pCreateFileA = RESOLVE(CreateFileA);
+// Attempt the device open with a specific (path, access) combination.
+// Returns handle or INVALID_HANDLE_VALUE. Fills outErr on failure.
+static HANDLE TryOpenDevice(const char* path, DWORD access, DWORD* outErr) {
+    auto pCreateFileA  = RESOLVE(CreateFileA);
+    auto pGetLastError = RESOLVE(GetLastError);
+    HANDLE h = pCreateFileA
+        ? pCreateFileA(path, access,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE,
+                       nullptr, OPEN_EXISTING, 0, nullptr)
+        : INVALID_HANDLE_VALUE;
+    if (h == INVALID_HANDLE_VALUE && outErr && pGetLastError)
+        *outErr = pGetLastError();
+    return h;
+}
+
+// Case-B recovery: the DACL on \Device\__WDT__ may block GENERIC_READ|WRITE
+// even from an admin process. Fall through several access modes and path
+// spellings until one opens, then close it — we only need to prove the
+// device is reachable. Returns the last err code on total failure.
+static bool ProbeDeviceAllVariants(DWORD* outErr) {
     auto pCloseHandle = RESOLVE(CloseHandle);
-    if (!pCreateFileA || !pCloseHandle) return false;
-    HANDLE h = pCreateFileA(skCrypt("\\\\.\\__WDT__"),
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr, OPEN_EXISTING, 0, nullptr);
-    bool ok = (h != INVALID_HANDLE_VALUE);
-    if (ok) pCloseHandle(h);
-    return ok;
+    if (!pCloseHandle) { if (outErr) *outErr = 0; return false; }
+
+    struct Attempt { const char* path; DWORD access; };
+    // Ordered from strictest to loosest; first success wins.
+    Attempt attempts[] = {
+        { skCrypt("\\\\.\\__WDT__"),          GENERIC_READ | GENERIC_WRITE },
+        { skCrypt("\\\\.\\__WDT__"),          GENERIC_READ                 },
+        { skCrypt("\\\\.\\__WDT__"),          SYNCHRONIZE                  },
+        { skCrypt("\\\\.\\__WDT__"),          0                            },
+        { skCrypt("\\\\.\\GLOBALROOT\\Device\\__WDT__"), GENERIC_READ | GENERIC_WRITE },
+        { skCrypt("\\\\.\\GLOBALROOT\\Device\\__WDT__"), 0                 },
+        { skCrypt("\\\\?\\__WDT__"),          GENERIC_READ | GENERIC_WRITE },
+    };
+    DWORD lastErr = 0;
+    for (auto& a : attempts) {
+        DWORD e = 0;
+        HANDLE h = TryOpenDevice(a.path, a.access, &e);
+        if (h != INVALID_HANDLE_VALUE) {
+            pCloseHandle(h);
+            if (outErr) *outErr = 0;
+            return true;
+        }
+        lastErr = e;
+    }
+    if (outErr) *outErr = lastErr;
+    return false;
+}
+
+// Backward-compat shim — most callers use this shape.
+static bool IsDriverLoaded(DWORD* outErr = nullptr) {
+    return ProbeDeviceAllVariants(outErr);
+}
+
+// Case-C recovery: SCM says the service crashed (state=STOPPED) or the
+// device is unopenable after a fresh start. Stop the service if it's
+// stuck and restart it once. Returns true if the restart cycle produced
+// a working device.
+static bool RestartDriverService(const char* svcName) {
+    auto pOpenSCManagerA     = RESOLVE(OpenSCManagerA);
+    auto pOpenServiceA       = RESOLVE(OpenServiceA);
+    auto pControlService     = RESOLVE(ControlService);
+    auto pQueryServiceStatus = RESOLVE(QueryServiceStatus);
+    auto pStartServiceA      = RESOLVE(StartServiceA);
+    auto pCloseServiceHandle = RESOLVE(CloseServiceHandle);
+    if (!pOpenSCManagerA || !pOpenServiceA || !pStartServiceA || !pCloseServiceHandle)
+        return false;
+
+    SC_HANDLE hSCM = pOpenSCManagerA(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!hSCM) return false;
+    SC_HANDLE hSvc = pOpenServiceA(hSCM, svcName,
+                                    SERVICE_START | SERVICE_STOP | SERVICE_QUERY_STATUS);
+    if (!hSvc) { pCloseServiceHandle(hSCM); return false; }
+
+    // Stop if currently running (or in a transitional state).
+    if (pControlService && pQueryServiceStatus) {
+        SERVICE_STATUS ss{};
+        if (pQueryServiceStatus(hSvc, &ss) && ss.dwCurrentState != SERVICE_STOPPED) {
+            SERVICE_STATUS discard{};
+            pControlService(hSvc, SERVICE_CONTROL_STOP, &discard);
+            for (int i = 0; i < 40; i++) {
+                if (pQueryServiceStatus(hSvc, &ss) && ss.dwCurrentState == SERVICE_STOPPED) break;
+                Sleep(100);
+            }
+        }
+    }
+
+    Sleep(200);
+    BOOL started = pStartServiceA(hSvc, 0, nullptr);
+    pCloseServiceHandle(hSvc);
+    pCloseServiceHandle(hSCM);
+    if (!started) return false;
+
+    // Wait up to 4 s for the fresh device to publish.
+    for (int i = 0; i < 40; i++) {
+        if (ProbeDeviceAllVariants(nullptr)) return true;
+        Sleep(100);
+    }
+    return false;
+}
+
+// Full three-case recovery. Returns true when the device is ready.
+//   Case A (svc=RUNNING, err=2)  → give the driver longer to publish,
+//                                  then try a stop/start cycle
+//   Case B (svc=RUNNING, err=5)  → already covered by ProbeDeviceAllVariants
+//                                  above (multiple access-mode fallbacks)
+//   Case C (svc=STOPPED)         → restart cycle
+static bool RecoverDriverDevice(const char* svcName, int budgetMs = 20000) {
+    auto pOpenSCManagerA     = RESOLVE(OpenSCManagerA);
+    auto pOpenServiceA       = RESOLVE(OpenServiceA);
+    auto pQueryServiceStatus = RESOLVE(QueryServiceStatus);
+    auto pCloseServiceHandle = RESOLVE(CloseServiceHandle);
+    if (!pOpenSCManagerA || !pOpenServiceA || !pQueryServiceStatus || !pCloseServiceHandle)
+        return ProbeDeviceAllVariants(nullptr);
+
+    int waited = 0;
+    bool triedRestart = false;
+    while (waited < budgetMs) {
+        // Case B fix runs first inside ProbeDeviceAllVariants (access variants).
+        if (ProbeDeviceAllVariants(nullptr)) return true;
+
+        // Sample service state to decide next action.
+        SC_HANDLE hSCM = pOpenSCManagerA(nullptr, nullptr, SC_MANAGER_CONNECT);
+        DWORD state = 0;
+        if (hSCM) {
+            SC_HANDLE hSvc = pOpenServiceA(hSCM, svcName, SERVICE_QUERY_STATUS);
+            if (hSvc) {
+                SERVICE_STATUS ss{};
+                if (pQueryServiceStatus(hSvc, &ss)) state = ss.dwCurrentState;
+                pCloseServiceHandle(hSvc);
+            }
+            pCloseServiceHandle(hSCM);
+        }
+
+        // Case C — driver crashed after load. One clean restart cycle.
+        if (state == SERVICE_STOPPED && !triedRestart) {
+            triedRestart = true;
+            if (RestartDriverService(svcName)) return true;
+            waited += 5000; // restart cycle already burns ~4-5 s
+            continue;
+        }
+
+        // Case A — service running but device still absent. Wait longer
+        // (some drivers publish the symlink lazily after WdfDeviceCreate)
+        // then try a restart cycle once.
+        if (state == SERVICE_RUNNING && !triedRestart) {
+            // Give it another 3 s of settle time before escalating.
+            for (int i = 0; i < 30 && waited < budgetMs; i++) {
+                Sleep(100); waited += 100;
+                if (ProbeDeviceAllVariants(nullptr)) return true;
+            }
+            if (waited >= budgetMs) break;
+            // Escalate to restart cycle.
+            triedRestart = true;
+            if (RestartDriverService(svcName)) return true;
+            waited += 5000;
+            continue;
+        }
+
+        Sleep(200); waited += 200;
+    }
+    return false;
+}
+
+// Query current service state via SCM. Useful to distinguish "driver
+// crashed after load" (state=STOPPED) from "driver running but device
+// never published" (state=RUNNING, but device unopenable).
+static DWORD QueryServiceState(const char* svcName) {
+    auto pOpenSCManagerA     = RESOLVE(OpenSCManagerA);
+    auto pOpenServiceA       = RESOLVE(OpenServiceA);
+    auto pQueryServiceStatus = RESOLVE(QueryServiceStatus);
+    auto pCloseServiceHandle = RESOLVE(CloseServiceHandle);
+    if (!pOpenSCManagerA || !pOpenServiceA || !pQueryServiceStatus || !pCloseServiceHandle) return 0;
+    SC_HANDLE hSCM = pOpenSCManagerA(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!hSCM) return 0;
+    SC_HANDLE hSvc = pOpenServiceA(hSCM, svcName, SERVICE_QUERY_STATUS);
+    DWORD state = 0;
+    if (hSvc) {
+        SERVICE_STATUS ss{};
+        if (pQueryServiceStatus(hSvc, &ss)) state = ss.dwCurrentState;
+        pCloseServiceHandle(hSvc);
+    }
+    pCloseServiceHandle(hSCM);
+    return state;
+}
+static const char* SvcStateName(DWORD s) {
+    switch (s) {
+        case SERVICE_STOPPED:          return "STOPPED";
+        case SERVICE_START_PENDING:    return "START_PENDING";
+        case SERVICE_STOP_PENDING:     return "STOP_PENDING";
+        case SERVICE_RUNNING:          return "RUNNING";
+        case SERVICE_CONTINUE_PENDING: return "CONTINUE_PENDING";
+        case SERVICE_PAUSE_PENDING:    return "PAUSE_PENDING";
+        case SERVICE_PAUSED:           return "PAUSED";
+        default:                       return "(no service / unknown)";
+    }
+}
+
+// Write the config keys the WDTKernel driver reads at load time. Without
+// these under HKLM\SYSTEM\CurrentControlSet\Services\<svc>\Parameters,
+// the driver may refuse to create its device object.
+// Value names taken from the driver's own string table:
+//   Enabled           REG_DWORD  1
+//   Interval          REG_DWORD  60000
+//   Reboot            REG_DWORD  0    (no watchdog reboot)
+//   AutoRefreshCycle  REG_DWORD  30000
+//   MinInterval       REG_DWORD  1000
+//   SSID              REG_DWORD  0xFFFF (accept any / not hardware-locked)
+static void WriteDriverParameters(const char* svcName) {
+    using PFN_RegCreateKeyExA = LONG(WINAPI*)(HKEY, LPCSTR, DWORD, LPSTR, DWORD, REGSAM, LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD);
+    using PFN_RegSetValueExA  = LONG(WINAPI*)(HKEY, LPCSTR, DWORD, DWORD, const BYTE*, DWORD);
+    using PFN_RegCloseKey     = LONG(WINAPI*)(HKEY);
+    auto pRegCreateKeyExA = reinterpret_cast<PFN_RegCreateKeyExA>(
+        AntiDebug::ResolveExport(AntiDebug::Fnv1a("RegCreateKeyExA")));
+    auto pRegSetValueExA  = reinterpret_cast<PFN_RegSetValueExA>(
+        AntiDebug::ResolveExport(AntiDebug::Fnv1a("RegSetValueExA")));
+    auto pRegCloseKey     = reinterpret_cast<PFN_RegCloseKey>(
+        AntiDebug::ResolveExport(AntiDebug::Fnv1a("RegCloseKey")));
+    if (!pRegCreateKeyExA || !pRegSetValueExA || !pRegCloseKey) return;
+
+    char keyPath[256];
+    snprintf(keyPath, sizeof(keyPath),
+             "SYSTEM\\CurrentControlSet\\Services\\%s\\Parameters", svcName);
+    HKEY hKey = nullptr;
+    LONG r = pRegCreateKeyExA(HKEY_LOCAL_MACHINE, keyPath, 0, nullptr,
+                              REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
+                              nullptr, &hKey, nullptr);
+    if (r != ERROR_SUCCESS || !hKey) return;
+
+    struct DwVal { const char* name; DWORD value; };
+    DwVal vals[] = {
+        { "Enabled",          1        },
+        { "Interval",         60000    },
+        { "Reboot",           0        },
+        { "AutoRefreshCycle", 30000    },
+        { "MinInterval",      1000     },
+        { "SSID",             0xFFFF   },
+    };
+    for (auto& v : vals) {
+        pRegSetValueExA(hKey, v.name, 0, REG_DWORD,
+                        reinterpret_cast<const BYTE*>(&v.value), sizeof(v.value));
+    }
+    pRegCloseKey(hKey);
 }
 
 // Fast sanity check: the file at drvPath must exist, start with MZ,
@@ -169,6 +401,11 @@ static bool StartDriver() {
         std::cout << "[!] SCM open failed\n";
         return false;
     }
+
+    // Populate the driver's Parameters subkey BEFORE the first StartService
+    // attempt. The WDT driver reads Enabled/Interval/Reboot/etc from here
+    // during DriverEntry; missing values can cause it to skip device creation.
+    WriteDriverParameters(svcName);
 
     // Reuse existing service entry after reboot — avoids Event ID 7045 on every launch.
     SC_HANDLE hExist = pOpenServiceA(hSCM, svcName, SERVICE_ALL_ACCESS);
@@ -352,9 +589,46 @@ int main()
     // ── Driver loading ────────────────────────────────────────────────────────
     std::cout << "  \033[96m[*]\033[0m Starting driver...\n";
     bool drvStarted = StartDriver();
-    std::cout << (drvStarted
-        ? "  \033[92m[+]\033[0m Driver ready.\n\n"
-        : "  \033[91m[!]\033[0m Driver start failed.\n\n");
+    if (drvStarted) {
+        // Report what SCM thinks so a "loaded but no device" case shows up
+        // immediately — before the 15-second spinner wait.
+        DWORD state = QueryServiceState(GetSvcName());
+        DWORD probeErr = 0;
+        bool  probeOk  = IsDriverLoaded(&probeErr);
+        std::cout << "  \033[92m[+]\033[0m Driver ready.  service=" << SvcStateName(state)
+                  << "  device=" << (probeOk ? "open" : "unavailable");
+        if (!probeOk) std::cout << " (err=" << probeErr << ")";
+        std::cout << "\n";
+
+        // If the device didn't come up on the first probe, run the three-case
+        // recovery: access-mode fallback (Case B), settle+wait (Case A),
+        // stop/start cycle (Case C). Silent when the first probe already
+        // succeeded so happy-path output stays clean.
+        if (!probeOk) {
+            std::cout << "  \033[96m[*]\033[0m Device not immediately available — running recovery...\n";
+            bool recovered = RecoverDriverDevice(GetSvcName(), 20000);
+            if (recovered) {
+                DWORD st2 = QueryServiceState(GetSvcName());
+                std::cout << "  \033[92m[+]\033[0m Recovery ok.  service=" << SvcStateName(st2) << "  device=open\n";
+            } else {
+                DWORD st2 = QueryServiceState(GetSvcName());
+                DWORD e2 = 0;
+                (void)IsDriverLoaded(&e2);
+                std::cout << "  \033[91m[!]\033[0m Recovery failed.  service=" << SvcStateName(st2)
+                          << "  device err=" << e2 << "\n";
+                if (e2 == 2) {
+                    std::cout << "      → Driver loaded but never published \\Device\\__WDT__.\n"
+                                 "        Most likely this driver is a PnP function driver bound to specific\n"
+                                 "        hardware not present on this system, so its device-creation callback\n"
+                                 "        never fires. A different driver whose DriverEntry unconditionally\n"
+                                 "        creates a control device would be needed.\n";
+                }
+            }
+        }
+        std::cout << "\n";
+    } else {
+        std::cout << "  \033[91m[!]\033[0m Driver start failed.\n\n";
+    }
 
     if (!drvStarted) {
         std::cout << "  Press Enter to exit.\n";
@@ -369,8 +643,9 @@ int main()
         int  spinIdx   = 0;
         const char* sp = "|/-\\";
 
+        DWORD lastDrvErr = 0;
         while (!drvReady || !cs2Ready) {
-            drvReady = IsDriverLoaded();
+            drvReady = IsDriverLoaded(&lastDrvErr);
             cs2Ready = IsProcessRunning(skCrypt("cs2.exe"));
 
             std::cout
@@ -383,7 +658,25 @@ int main()
             std::cout.flush();
 
             if (!drvReady && waitedMs >= 15000) {
-                std::cout << "\n\n  \033[91m[!]\033[0m Driver did not load.\n\n  Press Enter to exit.\n";
+                // Diagnostic — spell out exactly why the driver looks up as
+                // "not loaded" so the user isn't left guessing.
+                DWORD state = QueryServiceState(GetSvcName());
+                std::cout << "\n\n  \033[91m[!]\033[0m Driver did not load.\n";
+                std::cout << "      Service:        " << GetSvcName() << " (state=" << SvcStateName(state) << ")\n";
+                std::cout << "      Device probe:   \\\\.\\__WDT__  err=" << lastDrvErr;
+                switch (lastDrvErr) {
+                    case 2:   std::cout << " (ERROR_FILE_NOT_FOUND — driver loaded but never published its device object;\n"
+                                          "                            typically means it's PnP-oriented and needs matching hardware,\n"
+                                          "                            or a policy stripped device creation at load)"; break;
+                    case 5:   std::cout << " (ERROR_ACCESS_DENIED — device exists but its DACL rejects this process)"; break;
+                    case 32:  std::cout << " (ERROR_SHARING_VIOLATION — another handle holds it exclusively)"; break;
+                    case 6:   std::cout << " (ERROR_INVALID_HANDLE — device stack is in a bad state)"; break;
+                    case 21:  std::cout << " (ERROR_NOT_READY — driver still initialising, symlink not yet published)"; break;
+                    case 87:  std::cout << " (ERROR_INVALID_PARAMETER — device path malformed at kernel side)"; break;
+                    case 231: std::cout << " (ERROR_PIPE_BUSY — device serving another client, retry later)"; break;
+                    default:  break;
+                }
+                std::cout << "\n\n  Press Enter to exit.\n";
                 std::cin.get();
                 goto exit;
             }
