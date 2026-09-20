@@ -917,8 +917,33 @@ private:
         // Stamp the 8-byte PA header at the head of the caller's buffer.
         // The driver will overwrite these same 8 bytes with the first 8
         // bytes of the read payload — exactly the semantics we want.
-        SivPhyMemReq* hdr = reinterpret_cast<SivPhyMemReq*>(out);
-        hdr->phys_addr = physAddr;
+        // Use memcpy rather than a struct write so an unaligned `out`
+        // pointer stays well-defined (x64 tolerates it in practice, but
+        // the analyzer is happier and future ARM64 ports are trivial).
+        memcpy(out, &physAddr, sizeof(physAddr));
+
+        // Zero the mode-selector region past the PA header.
+        //
+        // Verified against the SIV dispatch @ 0x22164 (IOCTL 0x10):
+        //   0x2219b:  cmp OutputBufferLength, 0x30      ; exact-48 gate
+        //   0x221a3:  jne <simple_mode>
+        //   0x221a5:  mov eax, [InputBuffer + 0x10]      ; mode-A selector
+        //   0x221b0:  test eax, eax
+        //   0x221b2:  je  <simple_mode>                  ; fall through if 0
+        //   ...       (else takes byte-mask/offset-stride path)
+        //     0x22305:  cmp DWORD [InputBuffer + 0x1c], 4  ; mode-B selector
+        //
+        // So an exact-48-byte read (`bone_data` is 32B and some entity
+        // sub-structs land at ~48B) whose caller-provided buffer happens
+        // to hold non-zero bytes at offsets 0x10..0x13 diverts the driver
+        // into a corrupt-data path. Zeroing offsets 8..31 kills both
+        // selectors regardless of what stack/heap junk was in `out`, at
+        // the cost of a 24-byte memset that vanishes into DRAM bandwidth
+        // (< 10 ns on DDR3-2800).
+        if (size > sizeof(physAddr)) {
+            size_t clear = (std::min)(size - sizeof(physAddr), (size_t)24);
+            memset(reinterpret_cast<uint8_t*>(out) + sizeof(physAddr), 0, clear);
+        }
 
         DWORD returned = 0;
         BOOL  ok = DeviceIoControl(hUse, IOCTL_SIV_PHY_MEMORY,
