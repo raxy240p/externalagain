@@ -1,5 +1,6 @@
 
 #include <iostream>
+#include <vector>
 #include <tlhelp32.h>
 #pragma comment(lib, "Winmm.lib")
 #include <timeapi.h>
@@ -507,56 +508,92 @@ static void StopDriver() {
     // DeleteFileA(GetDriverPath());
 }
 
-// Enable a set of admin-available-but-disabled-by-default privileges on the
-// current process token. SIVX64.sys imports SeSinglePrivilegeCheck and
-// enforces it inside IRP_MJ_CREATE, so an elevated admin process that
-// hasn't turned on the required privilege gets STATUS_ACCESS_DENIED
-// (err=5) back from CreateFileA on \\.\SIVDRIVER — the exact symptom
-// we see when the DACL is fine but the token isn't.
+// Enable admin-available-but-disabled-by-default privileges on the current
+// process token, then VERIFY each one is actually enabled and log the result.
 //
-// We turn on every privilege that an elevated admin token holds by default:
-// - SeDebugPrivilege        (main suspect for SIV — used by tools like SIV
-//                            that need to inspect kernel/other processes)
-// - SeLoadDriverPrivilege   (second-most-common gate)
-// - SeSecurityPrivilege     (WRITE_DAC on kernel objects)
-// - SeTakeOwnershipPrivilege
-// - SeBackupPrivilege / SeRestorePrivilege (bypass file DACLs)
-// - SeSystemEnvironmentPrivilege
-// - SeSystemProfilePrivilege
-// - SeManageVolumePrivilege
+// SIVX64.sys enforces one specific gate inside IRP_MJ_CREATE (verified
+// against dispatch @ 0x211c8):
+//     SeSinglePrivilegeCheck( SeLoadDriverPrivilege, UserMode ) → must be TRUE
+// otherwise it returns STATUS_ACCESS_DENIED (err=5).
 //
-// Any that our token doesn't hold silently fail — that's fine. Any that
-// hold but aren't currently enabled get flipped on. Cost: one syscall
-// per privilege, all under 1 ms total.
+// A previous silent-best-effort version of this function hid three failure
+// modes: LoadLibraryA of advapi32 not yet done → resolver returns nullptr
+// and the whole thing no-ops; token doesn't hold the privilege → success
+// with ERROR_NOT_ALL_ASSIGNED; another security layer strips it back off
+// after we enable. This version force-loads advapi32, then loops both
+// GetProcAddress-first and lazy-importer-second on the resolver, adjusts,
+// re-queries the token to CONFIRM each privilege is present + enabled,
+// and prints the truth so an err=5 aftermath has ground truth to work from.
 static void EnableAdminPrivileges() {
+    using PFN_LoadLibraryA         = HMODULE(WINAPI*)(LPCSTR);
+    using PFN_GetProcAddress       = FARPROC(WINAPI*)(HMODULE, LPCSTR);
     using PFN_OpenProcessToken     = BOOL(WINAPI*)(HANDLE, DWORD, PHANDLE);
     using PFN_LookupPrivilegeValueA = BOOL(WINAPI*)(LPCSTR, LPCSTR, PLUID);
+    using PFN_LookupPrivilegeNameA  = BOOL(WINAPI*)(LPCSTR, PLUID, LPSTR, LPDWORD);
     using PFN_AdjustTokenPrivileges = BOOL(WINAPI*)(HANDLE, BOOL, PTOKEN_PRIVILEGES, DWORD, PTOKEN_PRIVILEGES, PDWORD);
+    using PFN_GetTokenInformation  = BOOL(WINAPI*)(HANDLE, TOKEN_INFORMATION_CLASS, LPVOID, DWORD, PDWORD);
     using PFN_GetCurrentProcess    = HANDLE(WINAPI*)();
     using PFN_CloseHandle          = BOOL(WINAPI*)(HANDLE);
+    using PFN_GetLastError         = DWORD(WINAPI*)();
 
-    auto pOpenProcessToken     = reinterpret_cast<PFN_OpenProcessToken>(
-        AntiDebug::ResolveExport(AntiDebug::Fnv1a("OpenProcessToken")));
+    // Force-load advapi32 so its exports are available even when the CRT
+    // hasn't touched it yet (static CRT + no direct advapi32 references).
+    auto pLoadLibraryA_e = reinterpret_cast<PFN_LoadLibraryA>(
+        AntiDebug::ResolveExport(AntiDebug::Fnv1a("LoadLibraryA")));
+    HMODULE hAdvapi = pLoadLibraryA_e ? pLoadLibraryA_e(skCrypt("advapi32.dll")) : nullptr;
+
+    auto pGetProcAddress_e = reinterpret_cast<PFN_GetProcAddress>(
+        AntiDebug::ResolveExport(AntiDebug::Fnv1a("GetProcAddress")));
+
+    // Two-source resolver: try GetProcAddress on advapi32 first (bypasses any
+    // FNV1A collision or corrupted export-table state that AntiDebug relies
+    // on), fall back to the lazy-importer-style resolver.
+    auto resolve = [&](const char* name, uint32_t hash) -> void* {
+        if (hAdvapi && pGetProcAddress_e) {
+            if (auto p = pGetProcAddress_e(hAdvapi, name)) return (void*)p;
+        }
+        return (void*)AntiDebug::ResolveExport(hash);
+    };
+
+    auto pOpenProcessToken      = reinterpret_cast<PFN_OpenProcessToken>(
+        resolve("OpenProcessToken",       AntiDebug::Fnv1a("OpenProcessToken")));
     auto pLookupPrivilegeValueA = reinterpret_cast<PFN_LookupPrivilegeValueA>(
-        AntiDebug::ResolveExport(AntiDebug::Fnv1a("LookupPrivilegeValueA")));
+        resolve("LookupPrivilegeValueA",  AntiDebug::Fnv1a("LookupPrivilegeValueA")));
+    auto pLookupPrivilegeNameA  = reinterpret_cast<PFN_LookupPrivilegeNameA>(
+        resolve("LookupPrivilegeNameA",   AntiDebug::Fnv1a("LookupPrivilegeNameA")));
     auto pAdjustTokenPrivileges = reinterpret_cast<PFN_AdjustTokenPrivileges>(
-        AntiDebug::ResolveExport(AntiDebug::Fnv1a("AdjustTokenPrivileges")));
-    auto pGetCurrentProcess    = reinterpret_cast<PFN_GetCurrentProcess>(
+        resolve("AdjustTokenPrivileges",  AntiDebug::Fnv1a("AdjustTokenPrivileges")));
+    auto pGetTokenInformation   = reinterpret_cast<PFN_GetTokenInformation>(
+        resolve("GetTokenInformation",    AntiDebug::Fnv1a("GetTokenInformation")));
+    auto pGetCurrentProcess     = reinterpret_cast<PFN_GetCurrentProcess>(
         AntiDebug::ResolveExport(AntiDebug::Fnv1a("GetCurrentProcess")));
-    auto pCloseHandle          = reinterpret_cast<PFN_CloseHandle>(
+    auto pCloseHandle           = reinterpret_cast<PFN_CloseHandle>(
         AntiDebug::ResolveExport(AntiDebug::Fnv1a("CloseHandle")));
+    auto pGetLastError          = reinterpret_cast<PFN_GetLastError>(
+        AntiDebug::ResolveExport(AntiDebug::Fnv1a("GetLastError")));
 
     if (!pOpenProcessToken || !pLookupPrivilegeValueA
-        || !pAdjustTokenPrivileges || !pGetCurrentProcess || !pCloseHandle) return;
+        || !pAdjustTokenPrivileges || !pGetCurrentProcess || !pCloseHandle) {
+        std::cout << "  \033[91m[!]\033[0m EnableAdminPrivileges: advapi32 resolver failed"
+                  << " (OPT=" << (void*)pOpenProcessToken
+                  << " LPV=" << (void*)pLookupPrivilegeValueA
+                  << " ATP=" << (void*)pAdjustTokenPrivileges << ")\n";
+        return;
+    }
 
     HANDLE hTok = nullptr;
     if (!pOpenProcessToken(pGetCurrentProcess(),
-                           TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hTok) || !hTok)
+                           TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hTok) || !hTok) {
+        std::cout << "  \033[91m[!]\033[0m EnableAdminPrivileges: OpenProcessToken failed err="
+                  << (pGetLastError ? pGetLastError() : 0) << "\n";
         return;
+    }
 
+    // The one SIV cares about is at the top of the list — if that fails, the
+    // rest doesn't matter, but we still try them all so unrelated features work.
     static const char* const kPrivs[] = {
+        "SeLoadDriverPrivilege",     // ← THIS is the SIV IRP_MJ_CREATE gate
         "SeDebugPrivilege",
-        "SeLoadDriverPrivilege",
         "SeSecurityPrivilege",
         "SeTakeOwnershipPrivilege",
         "SeBackupPrivilege",
@@ -568,12 +605,57 @@ static void EnableAdminPrivileges() {
     for (const char* name : kPrivs) {
         TOKEN_PRIVILEGES tp{};
         tp.PrivilegeCount = 1;
-        if (!pLookupPrivilegeValueA(nullptr, name, &tp.Privileges[0].Luid)) continue;
+        if (!pLookupPrivilegeValueA(nullptr, name, &tp.Privileges[0].Luid)) {
+            std::cout << "  \033[93m[!]\033[0m LookupPrivilegeValueA(" << name
+                      << ") failed err=" << (pGetLastError ? pGetLastError() : 0) << "\n";
+            continue;
+        }
         tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        // Ignore the return value — if the token doesn't hold the privilege,
-        // AdjustTokenPrivileges returns success with GetLastError = 1300
-        // (ERROR_NOT_ALL_ASSIGNED). Not our problem here — we're best-effort.
         pAdjustTokenPrivileges(hTok, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    }
+
+    // Re-query the token and print which privileges are actually enabled.
+    // This is the ground-truth pass: if SeLoadDriverPrivilege isn't ENABLED
+    // after our AdjustTokenPrivileges loop, no amount of retry inside our
+    // own code will make SIV's IRP_MJ_CREATE gate pass — the fix is external
+    // (elevate differently, run under SYSTEM, or grant the privilege via
+    // local security policy: secpol.msc → Local Policies → User Rights
+    // Assignment → "Load and unload device drivers" → Add current user).
+    if (pGetTokenInformation) {
+        DWORD needed = 0;
+        pGetTokenInformation(hTok, TokenPrivileges, nullptr, 0, &needed);
+        if (needed) {
+            std::vector<uint8_t> buf(needed);
+            if (pGetTokenInformation(hTok, TokenPrivileges, buf.data(), needed, &needed)) {
+                auto* tp = reinterpret_cast<TOKEN_PRIVILEGES*>(buf.data());
+                bool loadDrvHeld = false, loadDrvEnabled = false;
+                for (DWORD i = 0; i < tp->PrivilegeCount; ++i) {
+                    // LUID low DWORD 10 = SeLoadDriverPrivilege
+                    if (tp->Privileges[i].Luid.LowPart == 10
+                        && tp->Privileges[i].Luid.HighPart == 0) {
+                        loadDrvHeld = true;
+                        loadDrvEnabled = (tp->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED) != 0;
+                    }
+                }
+                std::cout << "  \033[96m[*]\033[0m Token privileges: "
+                          << tp->PrivilegeCount << " held.  SeLoadDriverPrivilege: "
+                          << (loadDrvHeld ? (loadDrvEnabled ? "\033[92mENABLED\033[0m"
+                                                            : "\033[93mheld but DISABLED\033[0m")
+                                          : "\033[91mNOT HELD\033[0m") << "\n";
+                if (!loadDrvHeld) {
+                    std::cout << "  \033[91m[!]\033[0m Your token doesn't hold SeLoadDriverPrivilege.\n"
+                                 "      SIV's IRP_MJ_CREATE gate WILL reject with err=5 no matter what.\n"
+                                 "      Fix: secpol.msc → Local Policies → User Rights Assignment →\n"
+                                 "      'Load and unload device drivers' → add your user, log out/in.\n"
+                                 "      Or: run this exe from an elevated cmd started under the\n"
+                                 "      Administrators group (not standard user + UAC prompt).\n";
+                } else if (!loadDrvEnabled) {
+                    std::cout << "  \033[91m[!]\033[0m Privilege held but our AdjustTokenPrivileges call\n"
+                                 "      didn't stick. Something is stripping it back off. Check for\n"
+                                 "      third-party token filters (some AV / EDR do this).\n";
+                }
+            }
+        }
     }
     pCloseHandle(hTok);
 }
