@@ -507,6 +507,77 @@ static void StopDriver() {
     // DeleteFileA(GetDriverPath());
 }
 
+// Enable a set of admin-available-but-disabled-by-default privileges on the
+// current process token. SIVX64.sys imports SeSinglePrivilegeCheck and
+// enforces it inside IRP_MJ_CREATE, so an elevated admin process that
+// hasn't turned on the required privilege gets STATUS_ACCESS_DENIED
+// (err=5) back from CreateFileA on \\.\SIVDRIVER — the exact symptom
+// we see when the DACL is fine but the token isn't.
+//
+// We turn on every privilege that an elevated admin token holds by default:
+// - SeDebugPrivilege        (main suspect for SIV — used by tools like SIV
+//                            that need to inspect kernel/other processes)
+// - SeLoadDriverPrivilege   (second-most-common gate)
+// - SeSecurityPrivilege     (WRITE_DAC on kernel objects)
+// - SeTakeOwnershipPrivilege
+// - SeBackupPrivilege / SeRestorePrivilege (bypass file DACLs)
+// - SeSystemEnvironmentPrivilege
+// - SeSystemProfilePrivilege
+// - SeManageVolumePrivilege
+//
+// Any that our token doesn't hold silently fail — that's fine. Any that
+// hold but aren't currently enabled get flipped on. Cost: one syscall
+// per privilege, all under 1 ms total.
+static void EnableAdminPrivileges() {
+    using PFN_OpenProcessToken     = BOOL(WINAPI*)(HANDLE, DWORD, PHANDLE);
+    using PFN_LookupPrivilegeValueA = BOOL(WINAPI*)(LPCSTR, LPCSTR, PLUID);
+    using PFN_AdjustTokenPrivileges = BOOL(WINAPI*)(HANDLE, BOOL, PTOKEN_PRIVILEGES, DWORD, PTOKEN_PRIVILEGES, PDWORD);
+    using PFN_GetCurrentProcess    = HANDLE(WINAPI*)();
+    using PFN_CloseHandle          = BOOL(WINAPI*)(HANDLE);
+
+    auto pOpenProcessToken     = reinterpret_cast<PFN_OpenProcessToken>(
+        AntiDebug::ResolveExport(AntiDebug::Fnv1a("OpenProcessToken")));
+    auto pLookupPrivilegeValueA = reinterpret_cast<PFN_LookupPrivilegeValueA>(
+        AntiDebug::ResolveExport(AntiDebug::Fnv1a("LookupPrivilegeValueA")));
+    auto pAdjustTokenPrivileges = reinterpret_cast<PFN_AdjustTokenPrivileges>(
+        AntiDebug::ResolveExport(AntiDebug::Fnv1a("AdjustTokenPrivileges")));
+    auto pGetCurrentProcess    = reinterpret_cast<PFN_GetCurrentProcess>(
+        AntiDebug::ResolveExport(AntiDebug::Fnv1a("GetCurrentProcess")));
+    auto pCloseHandle          = reinterpret_cast<PFN_CloseHandle>(
+        AntiDebug::ResolveExport(AntiDebug::Fnv1a("CloseHandle")));
+
+    if (!pOpenProcessToken || !pLookupPrivilegeValueA
+        || !pAdjustTokenPrivileges || !pGetCurrentProcess || !pCloseHandle) return;
+
+    HANDLE hTok = nullptr;
+    if (!pOpenProcessToken(pGetCurrentProcess(),
+                           TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hTok) || !hTok)
+        return;
+
+    static const char* const kPrivs[] = {
+        "SeDebugPrivilege",
+        "SeLoadDriverPrivilege",
+        "SeSecurityPrivilege",
+        "SeTakeOwnershipPrivilege",
+        "SeBackupPrivilege",
+        "SeRestorePrivilege",
+        "SeSystemEnvironmentPrivilege",
+        "SeSystemProfilePrivilege",
+        "SeManageVolumePrivilege",
+    };
+    for (const char* name : kPrivs) {
+        TOKEN_PRIVILEGES tp{};
+        tp.PrivilegeCount = 1;
+        if (!pLookupPrivilegeValueA(nullptr, name, &tp.Privileges[0].Luid)) continue;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        // Ignore the return value — if the token doesn't hold the privilege,
+        // AdjustTokenPrivileges returns success with GetLastError = 1300
+        // (ERROR_NOT_ALL_ASSIGNED). Not our problem here — we're best-effort.
+        pAdjustTokenPrivileges(hTok, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    }
+    pCloseHandle(hTok);
+}
+
 static bool IsElevated() {
     using NtOPT_fn  = NTSTATUS(NTAPI*)(HANDLE, ACCESS_MASK, PHANDLE);
     using NtQIT_fn  = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
@@ -549,6 +620,13 @@ int main()
 
     AntiDebug::Assert();
 
+    // Enable admin-token privileges BEFORE the driver load. SIVX64.sys
+    // imports SeSinglePrivilegeCheck and enforces it inside IRP_MJ_CREATE,
+    // so device-open (CreateFileA on \\.\SIVDRIVER) returns err=5 for an
+    // admin whose token has SeDebugPrivilege / SeLoadDriverPrivilege held
+    // but not enabled — which is the default on any elevated admin.
+    EnableAdminPrivileges();
+
     // ── Driver loading ────────────────────────────────────────────────────────
     std::cout << "  \033[96m[*]\033[0m Starting driver...\n";
     bool drvStarted = StartDriver();
@@ -586,6 +664,20 @@ int main()
                                  "        HVCI/CI silently blocked the load, an anti-cheat DSE hook stripped\n"
                                  "        device creation, or the on-disk file's signature was altered.\n"
                                  "        Re-verify SHA256 (33903E8F...) and check HVCI blocklist state.\n";
+                } else if (e2 == 5) {
+                    std::cout << "      → Device exists but every access mode was rejected (ACCESS_DENIED).\n"
+                                 "        Token privileges have already been enabled before this probe, so\n"
+                                 "        the likely remaining causes are:\n"
+                                 "          1. An anti-cheat (Vanguard/EAC/BE) is running with an ObRegister-\n"
+                                 "             CallbacksEx hook stripping FILE_ALL_ACCESS from non-whitelisted\n"
+                                 "             processes on \\Device\\SIVDRIVER. Close CS2 and any anti-cheat\n"
+                                 "             tray process, verify with `pslist \\\\.\\SIVDRIVER handles`, retry.\n"
+                                 "          2. Windows Defender Attack Surface Reduction rule 'Block abuse of\n"
+                                 "             exploited vulnerable signed drivers' is on. Check via:\n"
+                                 "               Get-MpPreference | Select AttackSurfaceReductionRules_Ids\n"
+                                 "          3. A leftover handle from a previous SIV.exe run is holding the\n"
+                                 "             device exclusive-open. `handle64.exe SIVDRIVER` to find it.\n"
+                                 "          4. Token integrity level < High (elevation somehow degraded).\n";
                 }
             }
         }
