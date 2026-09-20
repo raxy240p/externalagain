@@ -1242,10 +1242,30 @@ private:
         const uint64_t pml4Idx = (kernVA >> 39) & 0x1FF;
         const uint64_t pml4Off = pml4Idx * 8;
 
-        const uint64_t limit = 0x10000000ULL;  // 256 MB — kernel PTs always in low RAM
+        // Was 256 MB. Modern Win11 (24H2 / 25H2) on boxes with ≥ 16 GB RAM
+        // allocates the kernel's page-table pool well above the low-RAM
+        // window — CR3 is routinely observed in the 1-4 GB physical range,
+        // occasionally higher. Bumped to 4 GB and instrumented so a scan
+        // that still comes up empty gives operator data to reason with
+        // (how many candidates hit PML4, how many made it through the full
+        // walk, and where the driver refused MmMapIoSpace).
+        const uint64_t limit = 0x100000000ULL;   // 4 GB
+        const uint64_t progressStep = 0x20000000; // 512 MB
 
-        uint64_t pml4Hits = 0, walkAttempts = 0;
+        uint64_t pml4Hits    = 0;
+        uint64_t walkAttempts = 0;
+        uint64_t translated   = 0;   // walks that produced a non-zero PA
+        uint64_t peChecked    = 0;   // PAs where HasPeHeader was queried
+        uint64_t nextProgress = progressStep;
+
         for (uint64_t candidate = 0x1000; candidate < limit; candidate += 0x1000) {
+            if (candidate >= nextProgress) {
+                printf(skCrypt("[SysMonitor] CR3 scan progress: %llu MB done, %llu PML4 hits so far, %llu translated\n"),
+                       (unsigned long long)(candidate >> 20),
+                       (unsigned long long)pml4Hits,
+                       (unsigned long long)translated);
+                nextProgress += progressStep;
+            }
             if (!IsSafeToMap(candidate)) continue;
 
             uint64_t pml4e = ReadPhys64(candidate + pml4Off);
@@ -1255,19 +1275,27 @@ private:
             walkAttempts++;
             uint64_t pa = TranslateWithCr3(candidate, kernVA);
             if (!pa) continue;
+            translated++;
 
+            peChecked++;
             if (HasPeHeader(pa)) {
-                printf(skCrypt("[SysMonitor] CR3 found at 0x%llX after %llu PML4 hits / %llu walks\n"),
+                printf(skCrypt("[SysMonitor] CR3 found at 0x%llX after %llu PML4 hits / %llu walks / %llu translated / %llu PE-checked\n"),
                        (unsigned long long)candidate,
                        (unsigned long long)pml4Hits,
-                       (unsigned long long)walkAttempts);
+                       (unsigned long long)walkAttempts,
+                       (unsigned long long)translated,
+                       (unsigned long long)peChecked);
                 *outKernPA = pa;
                 return candidate;
             }
         }
 
-        printf(skCrypt("[SysMonitor] CR3 scan exhausted 256MB: %llu PML4 hits, %llu walks, no valid CR3\n"),
-               (unsigned long long)pml4Hits, (unsigned long long)walkAttempts);
+        printf(skCrypt("[SysMonitor] CR3 scan exhausted %llu MB: %llu PML4 hits, %llu walks, %llu translated, %llu PE-checked, no valid CR3\n"),
+               (unsigned long long)(limit >> 20),
+               (unsigned long long)pml4Hits,
+               (unsigned long long)walkAttempts,
+               (unsigned long long)translated,
+               (unsigned long long)peChecked);
         return 0;
     }
 
@@ -1545,7 +1573,7 @@ private:
     //   kFailLogSlots: covers every current SivFail enumerator; increase
     //     alongside the enum if new codes are added.
     static constexpr int  kIoFailStreakBreaker = 32;
-    static constexpr int  kIoFailLogCap        = 10;
+    static constexpr int  kIoFailLogCap        = 40;
     static constexpr int  kFailLogSlots        = 9;
     std::atomic<int>      m_ioFailStreak       {0};
     std::atomic<bool>     m_ioBroken           {false};
