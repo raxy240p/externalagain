@@ -23,7 +23,7 @@
 // ── Per-machine hardware fingerprint ─────────────────────────────────────────
 // Mixes volume serial number + CPUID family/stepping into a stable DWORD.
 // Used to generate a machine-unique driver drop path that avoids a predictable
-// filename IOC like "CorsairLLAccess64.sys" while remaining stable across reboots.
+// filename IOC like "NTIOLib_X64.sys" while remaining stable across reboots.
 static DWORD GetHwKey() {
     DWORD serial = 0;
     using GVI_fn = BOOL(WINAPI*)(LPCSTR, LPSTR, DWORD, LPDWORD, LPDWORD, LPDWORD, LPSTR, DWORD);
@@ -36,8 +36,8 @@ static DWORD GetHwKey() {
 
 // ── Driver drop path ──────────────────────────────────────────────────────────
 // Generates a machine-stable path like %SystemRoot%\System32\drivers\A3F19C2B.sys.
-// Copy CorsairLLAccess64.sys (Corsair Memory, WHCP-signed, SHA256 01E024D3…)
-// to this path before launching.
+// Copy NTIOLib_X64.sys (MSI Center 2.0.35.0 drop, Micro-Star INT'L CO., LTD,
+// WHCP-signed, SHA256 2A36D9A2…) to this path before launching.
 static const char* GetDriverPath() {
     static char s_path[MAX_PATH] = {};
     static bool s_ready = false;
@@ -97,31 +97,19 @@ static HANDLE TryOpenDevice(const char* path, DWORD access, DWORD* outErr) {
     return h;
 }
 
-// Compute the user-mode device path for this run. Corsair's driver builds
-// \Device\<ServiceName> at DriverEntry from its own DriverObject.DriverName,
-// so the device path equals "\\.\<SvcName>" where <SvcName> is what SCM
-// registered us under. Machine-stable — same on every launch on this box.
+// NTIOLib hardcodes its \Device\NTIOLib_CC_COMM path at DriverEntry —
+// we can't rename it without patching the signed driver. The SCM service
+// name and on-disk filename remain machine-stable-hex to hide THOSE two
+// IOCs; the device path itself has to be accepted as-is.
 static const char* GetDevicePathUserMode() {
-    static char s_path[64] = {};
-    static bool s_ready = false;
-    if (!s_ready) {
-        snprintf(s_path, sizeof(s_path), "\\\\.\\%s", GetSvcName());
-        s_ready = true;
-    }
-    return s_path;
+    return "\\\\.\\NTIOLib_CC_COMM";
 }
 static const char* GetDevicePathGlobal() {
-    static char s_path[128] = {};
-    static bool s_ready = false;
-    if (!s_ready) {
-        snprintf(s_path, sizeof(s_path), "\\\\.\\GLOBALROOT\\Device\\%s", GetSvcName());
-        s_ready = true;
-    }
-    return s_path;
+    return "\\\\.\\GLOBALROOT\\Device\\NTIOLib_CC_COMM";
 }
 
 // Recovery probe: try several access modes + path spellings against the
-// device Corsair publishes for our service name. First success wins.
+// device NTIOLib publishes at DriverEntry. First success wins.
 static bool ProbeDeviceAllVariants(DWORD* outErr) {
     auto pCloseHandle = RESOLVE(CloseHandle);
     if (!pCloseHandle) { if (outErr) *outErr = 0; return false; }
@@ -302,8 +290,8 @@ static const char* SvcStateName(DWORD s) {
     }
 }
 
-// Corsair's DriverEntry creates \Device\<ServiceName> unconditionally and
-// reads no Parameters subkey values. The plain SCM registration under
+// NTIOLib's DriverEntry publishes \Device\NTIOLib_CC_COMM unconditionally
+// and reads no Parameters subkey values. Plain SCM registration under
 // HKLM\SYSTEM\...\Services\<svc> is enough for SCM to load it.
 
 // Fast sanity check: the file at drvPath must exist, start with MZ,
@@ -390,20 +378,20 @@ static bool StartDriver() {
         return false;
     }
 
-    // (CorsairLLAccess64.sys reads no Parameters values at DriverEntry —
-    // device creation is unconditional, so no pre-start registry writes needed.)
+    // (NTIOLib_X64.sys reads no Parameters values at DriverEntry — device
+    // creation is unconditional, so no pre-start registry writes needed.)
 
     // Validate the on-disk image BEFORE tearing down any existing service so
     // we don't leave dj without a working service AND without a valid file.
     if (GetFileAttributesA(drvPath) == INVALID_FILE_ATTRIBUTES) {
         std::cout << "[!] Driver file not found at: " << drvPath << "\n";
-        std::cout << "    Copy CorsairLLAccess64.sys to that path and retry.\n";
+        std::cout << "    Copy NTIOLib_X64.sys to that path and retry.\n";
         pCloseServiceHandle(hSCM);
         return false;
     }
     if (!ValidateDriverFile(drvPath)) {
         std::cout << "[!] Driver file at " << drvPath << " is not a valid PE image.\n";
-        std::cout << "    Re-copy CorsairLLAccess64.sys to that path.\n";
+        std::cout << "    Re-copy NTIOLib_X64.sys to that path.\n";
         pCloseServiceHandle(hSCM);
         return false;
     }
@@ -412,8 +400,8 @@ static bool StartDriver() {
     SC_HANDLE hExist = pOpenServiceA(hSCM, svcName, SERVICE_ALL_ACCESS);
     if (hExist) {
         // Self-healing lifecycle: if the service already exists (from a
-        // previous run, crashed session, or another user of Corsair's
-        // driver), stop → delete → recreate. This guarantees the device
+        // previous run, crashed session, or MSI Center holding NTIOLib
+        // open), stop → delete → recreate. This guarantees the device
         // object was published fresh under our expected name, and no stale
         // driver-state carries into this session.
         SERVICE_STATUS ss{};
@@ -485,13 +473,15 @@ static bool StartDriver() {
         if (*hint) std::cout << " — " << hint;
         std::cout << "\n";
         if (err == 577 || err == 1275) {
-            std::cout << "    Driver blocklist rejected CorsairLLAccess64.\n"
+            std::cout << "    Driver blocklist rejected NTIOLib_X64.\n"
                          "    Options:\n"
                          "      - Verify the .sys file matches the expected SHA256\n"
-                         "        (01E024D3C76FB1B71851AB7761AFBEE23159D6E8CBF7F5F1D5052EFCA2F7756D)\n"
+                         "        (2A36D9A22DFF680CE46284EF718E647BD5A8FC5F095C2ACBBEC3A7F50926EB7F)\n"
                          "      - HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Config"
                          " → VulnerableDriverBlocklistEnable = 0, reboot\n"
-                         "      - Or use a Windows build/SKU without the blocklist\n";
+                         "      - Fall back to the sibling MSI Center build:\n"
+                         "        NTIOLib v3.0.0.10 (SHA256 3BBBCD444C82E287C9E06D198580FF4B\n"
+                         "        500994072F804A59B204DAAA968324E4), device \\\\.\\NTIOLib_CC_Clock\n";
         }
         pDeleteService(hSvc);
         // Leave the .sys file on disk so the user can diagnose (blocklist,
@@ -543,7 +533,7 @@ static void StopDriver() {
     pCloseServiceHandle(hSCM);
     // Keep the driver file on disk between runs — the machine-stable filename
     // acts as a persistent one-shot cache. Deleting it forces a re-copy of
-    // CorsairLLAccess64.sys before every launch. If you want strict clean-up
+    // NTIOLib_X64.sys before every launch. If you want strict clean-up
     // on exit for stealth, uncomment the DeleteFileA call below.
     // DeleteFileA(GetDriverPath());
 }
@@ -551,15 +541,13 @@ static void StopDriver() {
 // Enable admin-available-but-disabled-by-default privileges on the current
 // process token.
 //
-// CorsairLLAccess64's IRP_MJ_CREATE does NOT gate on SeLoadDriverPrivilege.
-// It checks the caller's token integrity level and rejects anything below
-// SECURITY_MANDATORY_HIGH_RID (0x3000). Running from
-// an elevated cmd (Admin group + UAC-elevated) satisfies that at High IL by
-// default, so this helper is not strictly required for Corsair — kept here
-// because enabling SeDebug/SeSecurity/etc. is still useful for other paths
-// (process handle open, token dupe, etc.) and costs nothing on the happy
-// path. It also prints ground-truth for the token so a future integrity
-// mismatch has diagnostics to work from.
+// NTIOLib's IRP_MJ_CREATE is a trivial no-op — the device's DACL
+// (admin+SYSTEM RW, applied by IoCreateDevice+FILE_DEVICE_SECURE_OPEN)
+// is what decides who gets in. An elevated cmd (Admin group + UAC-elevated)
+// clears that DACL. This helper isn't strictly required for NTIOLib, but
+// enabling SeDebug / SeSecurity / etc. is still useful for other paths
+// (process handle open, token dupe, module walks) and costs nothing on
+// the happy path.
 static void EnableAdminPrivileges() {
     using PFN_LoadLibraryA         = HMODULE(WINAPI*)(LPCSTR);
     using PFN_GetProcAddress       = FARPROC(WINAPI*)(HMODULE, LPCSTR);
@@ -648,7 +636,7 @@ static void EnableAdminPrivileges() {
         pAdjustTokenPrivileges(hTok, FALSE, &tp, sizeof(tp), nullptr, nullptr);
     }
 
-    // Re-query the token and print a summary. Corsair does not gate on
+    // Re-query the token and print a summary. NTIOLib does not gate on
     // SeLoadDriverPrivilege, but we still surface its state — an err=5 on
     // an unusual host may correlate with an unexpected token shape.
     if (pGetTokenInformation) {
@@ -721,16 +709,16 @@ int main()
 
     AntiDebug::Assert();
 
-    // Enable admin-token privileges before the driver load. Corsair's
-    // IRP_MJ_CREATE only requires token integrity ≥ High (satisfied by
-    // running elevated), but SeDebug/SeSecurity being enabled early helps
-    // downstream (process token dupe, module walks). Cheap on happy path.
+    // Enable admin-token privileges before the driver load. NTIOLib's DACL
+    // is what gates our access — SeDebug/SeSecurity being enabled early
+    // helps downstream (process token dupe, module walks). Cheap on
+    // happy path.
     EnableAdminPrivileges();
 
-    // Tell WinDrvReader the exact device path derived from our service name.
-    // Corsair builds \Device\<ServiceName> at DriverEntry, so once StartDriver
-    // registers us as GetSvcName(), the device is at \\.\<GetSvcName()>.
-    WinDrvReader::Get().SetDevicePath(GetDevicePathUserMode());
+    // NTIOLib publishes \Device\NTIOLib_CC_COMM at DriverEntry — the path
+    // is hardcoded in the signed driver's .rdata and can't be changed
+    // without breaking the signature. WinDrvReader already knows the
+    // constant; no runtime path injection needed.
 
     // ── Driver loading ────────────────────────────────────────────────────────
     std::cout << "  \033[96m[*]\033[0m Starting driver...\n";
@@ -764,16 +752,16 @@ int main()
                           << "  device err=" << e2 << "\n";
                 if (e2 == 2) {
                     std::cout << "      → Driver loaded but never published its device object.\n"
-                                 "        Corsair's DriverEntry creates \\Device\\<SvcName> unconditionally, so\n"
-                                 "        err=2 here after a successful service start usually means HVCI/CI\n"
-                                 "        silently blocked the load, an AC DSE hook stripped device creation,\n"
-                                 "        or the on-disk file's signature was altered. Re-verify SHA256\n"
-                                 "        (01E024D3...) and check HVCI blocklist state.\n";
+                                 "        NTIOLib's DriverEntry publishes \\Device\\NTIOLib_CC_COMM\n"
+                                 "        unconditionally, so err=2 after a successful service start usually\n"
+                                 "        means HVCI/CI silently blocked the load, an AC DSE hook stripped\n"
+                                 "        device creation, or the on-disk file's signature was altered.\n"
+                                 "        Re-verify SHA256 (2A36D9A2...) and check HVCI blocklist state.\n";
                 } else if (e2 == 5) {
                     std::cout << "      → Device exists but IRP_MJ_CREATE was rejected (ACCESS_DENIED).\n"
-                                 "        Corsair enforces token integrity ≥ High on open. Likely causes:\n"
-                                 "          1. Token integrity level < High. Re-launch from an elevated cmd\n"
-                                 "             started under the Administrators group (not SUA + UAC prompt).\n"
+                                 "        NTIOLib's DACL is admin+SYSTEM RW. Likely causes for a denial:\n"
+                                 "          1. Not launched from an elevated cmd (admin+UAC-elevated).\n"
+                                 "             Standard user or non-elevated admin gets refused before CREATE.\n"
                                  "          2. Anti-cheat ObRegisterCallbacksEx hook stripping FILE_ALL_ACCESS\n"
                                  "             on our device. Close CS2 + any AC tray processes and retry.\n"
                                  "          3. Windows Defender ASR rule 'Block abuse of exploited vulnerable\n"

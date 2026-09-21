@@ -13,107 +13,122 @@
 #include <lazy_importer/lazy_importer.hpp>
 #include "core/anti_debug/AntiDebug.hpp"
 
-// CorsairLLAccess64.sys (Corsair Memory, Inc., v1.0.24.0, WHCP-signed).
-// SHA256: 01E024D3C76FB1B71851AB7761AFBEE23159D6E8CBF7F5F1D5052EFCA2F7756D
-// Signer: Corsair Components, Inc. via Microsoft Windows Third Party
-//         Component CA 2014 → Microsoft Windows Hardware Compatibility
-//         Publisher. WHQL Authenticode chain, timestamp cert good through
-//         2029. Loads on stock Windows 11 with Secure Boot.
-// Not on Microsoft's HVCI vulnerable-driver blocklist. Low profile — one
-// public writeup from 2022, no LOLDrivers "commonly-abused" listing.
+// NTIOLib_X64.sys (Micro-Star INT'L CO., LTD., v3.0.0.11, WHCP-signed).
+// SHA256: 2A36D9A22DFF680CE46284EF718E647BD5A8FC5F095C2ACBBEC3A7F50926EB7F
+// Signer: MICRO-STAR INTERNATIONAL CO., LTD. via GlobalSign GCC R45 EV
+//         CodeSigning CA 2020 (EV code-signing chain), attribute-signed
+//         via Microsoft Windows Third Party Component CA 2014 →
+//         Microsoft Windows Hardware Compatibility Publisher. Loads on
+//         stock Windows 11 with Secure Boot.
 //
-// Device path: dynamically built from the SERVICE name at DriverEntry —
-// the driver reads its own DriverObject.DriverName (which starts with
-// "\Driver\<ServiceName>") and constructs "\Device\<ServiceName>" +
-// "\DosDevices\<ServiceName>". We register the service under our
-// machine-stable hex name (see GetSvcName in main.cpp), so the user-mode
-// path becomes "\\.\<hwkey>". Set at runtime via the shared helper.
+// Ships with MSI Center 2.0.35.0. Older NTIOLib/MsIo64 SHA256s are on
+// Microsoft's HVCI vulnerable-driver blocklist and LOLDrivers, but this
+// specific 2024-01 build (SHA256 above) is OFF both lists as verified
+// against the current dataset. Should HVCI enforcement flip against it,
+// swap to the sibling v3.0.0.10 build shipped in the same package
+// (SHA256 3BBBCD444C82E287C9E06D198580FF4B500994072F804A59B204DAAA968324E4,
+// device path \Device\NTIOLib_CC_Clock).
 //
-// IRP_MJ_CREATE gate (verified against CREATE handler @ 0x1400010d0):
-//   SeQueryInformationToken( TokenIntegrityLevel, ... ) →
-//     token IntegrityLevel must be ≥ 0x3000 (SECURITY_MANDATORY_HIGH_RID)
-//   otherwise STATUS_ACCESS_DENIED (0xC0000022). An elevated admin token
-//   passes; standard user or non-elevated admin is denied. Our main()'s
-//   IsElevated() check already enforces this upstream, so open just works.
+// Device path: HARDCODED at DriverEntry (verified against the .rdata
+// UNICODE_STRING at 0x140001af0). Publishes:
+//   \Device\NTIOLib_CC_COMM
+//   \DosDevices\NTIOLib_CC_COMM
+// User-mode path: "\\.\NTIOLib_CC_COMM". The SERVICE name we register
+// under (see GetSvcName in main.cpp — machine-stable hex) affects only
+// SCM registration and the on-disk .sys filename, NOT the device path.
+// The device-path IOC is mitigated by idle-mode handle closure between
+// scans; the handle is open only during the tight IOCTL burst.
 //
-// IOCTL surface (dispatch on raw IoControlCode, DeviceType 0x22):
-//   0x225348  read op                        (unused here)
-//   0x225358  I/O port read                  (unused here)
-//   0x225374  MDL-based phys → user-VA map   (unused here, future opt)
-//   0x22537C  version stub → 0x01000018      (unused here)
-//   0x225388  MSR / thermal read op          (unused here)
-//   0x22934C  ← WRITE phys memory (byte/word/dword, 32-bit PA)
-//   0x229350  ← READ  phys memory (byte/word/dword, 32-bit PA)
-//   0x229354  I/O port write                 (unused here)
-//   0x229378  another read op                (unused here)
-//   0x229380  PCI config write via HalSet    (unused here)
-//   0x229384  another op                     (unused here)
+// IRP_MJ_CREATE gate (verified against CREATE dispatcher @ 0x1400010d0):
+//   trivial no-op — returns STATUS_SUCCESS unconditionally. DACL comes
+//   from IoCreateDevice's default (admin+SYSTEM RW; FILE_DEVICE_SECURE_OPEN
+//   flag on the device object). Elevated admin passes; standard user is
+//   refused by the DACL before CREATE runs.
 //
-// IOCTL 0x229350 primitive (verified @ 0x14000185c, dl = is_write flag = 0):
-//   METHOD_BUFFERED. InputLength ≥ 0xC, OutputLength ≥ 0xA.
-//   Input struct layout:
-//     +0x00  uint32 phys_addr_low    ← 32-bit PA (upper bits forced to 0)
-//     +0x04  uint32 phys_addr_high   ← ignored on read
-//     +0x08  uint16 size             ← MUST be 1, 2, or 4
-//     +0x0A  uint16 pad
-//   Driver: MmMapIoSpace(PA, size, MmNonCached) → typed load (byte/word/dword)
-//     → writes value to *IoStatus.Information (a pointer to IRP+0x38).
-//   User side: DeviceIoControl returns TRUE and the read value comes back
-//   via lpBytesReturned. Yes, "bytes returned" IS the data — unusual but
-//   deliberate. IoStatus.Status = STATUS_SUCCESS on the happy path.
+// Activation gate: before any read/write IOCTL succeeds, the driver's
+// global at 0x140003010 must equal 0x2F405A34 (verified @ 0x1400013c4).
+// User mode arms it via IOCTL 0x2A00 0xC3502000 with the magic word placed
+// in the shared METHOD_BUFFERED buffer's first DWORD (OutputBufferLength
+// must be 4). Once armed it stays armed for the driver's lifetime.
 //
-// Trade-offs vs. SIV / bsitf we tried:
-//   + Simpler descriptor, no scatter/gather, no state-based reads
-//   + Kernel-managed PT pages ARE mappable here (SIV refused them on 25H2)
-//   + No SeSinglePrivilegeCheck gate (SIV's was the SeLoadDriverPrivilege
-//     block that stopped us on 25H2 until we enabled the priv)
-//   + No SMBIOS vendor gate (bsitf demanded ASUS motherboard, blocked MSI)
-//   - 32-bit PA cap: fine for kernel PT pages on any typical Win11 box
-//     (ntoskrnl PA seen at ~470 MB); the CR3 scan stays under 4 GB
-//   - Read granularity 1/2/4 bytes: a 4 KB page fill costs 1024 IOCTLs
-//     (same as the WDTKernel era before we found SIV's bulk mode)
-#define IOCTL_CLL_READ_PHYS             0x229350u
-#define IOCTL_CLL_WRITE_PHYS            0x22934Cu
-
-// Minimum sizes required by the driver's dispatch (0x14000187b: cmp r8d,0xA;
-// jb error). We always send 12 bytes to satisfy both InputLength ≥ 0xC and
-// OutputLength ≥ 0xA. Individual read primitives never exceed 4 bytes so
-// there is no ceiling to worry about beyond the size-{1,2,4} rule.
-#define CLL_BUF_SIZE                    12u
+// IOCTL surface (dispatch on raw IoControlCode, DeviceType 0xC350):
+//   0xC3502000  ARM — set global magic (input+output buf DWORD 0 = magic)
+//   0xC3502004  version stub (writes global +0x14 to caller)
+//   0xC3502084  MSR-family write path      (unused here)
+//   0xC3502088  MSR-family read path       (unused here)
+//   0xC350214C  PCI/HW-info stub           (unused here)
+//   0xC35060C8  I/O port read byte (in al,dx)
+//   0xC35060CC  I/O port read byte alt
+//   0xC35060D0  I/O port read word
+//   0xC35060D4  I/O port read dword
+//   0xC3506104  ← READ  phys memory (MmMapIoSpace + rep movs, 64-bit PA)
+//   0xC3506144  READ  phys memory (cached mapping variant)
+//   0xC350A108  I/O port write             (unused here)
+//   0xC350A148  ← WRITE phys memory (unused here; ESP is read-only)
+//   0xC350A0D8/DC/E0  port-write byte/word/dword
+//
+// IOCTL 0xC3506104 primitive (verified @ 0x1400013ac, secondary handler
+// invoked by the DEVICE_CONTROL dispatcher at 0x140001100):
+//   METHOD_BUFFERED. InputLength == 0x10, OutputLength >= unit_size*count.
+//   Input struct:
+//     +0x00  uint64 phys_addr        ← full 64-bit PA
+//     +0x08  uint32 unit_size        ← MUST be 1, 2, or 4
+//     +0x0C  uint32 count            ← number of units
+//   Driver: MmMapIoSpace(PA, unit_size*count, MmNonCached) →
+//     rep movsb/w/d from mapped region → output buffer →
+//     MmUnmapIoSpace → IoStatus.Information = OutputBufferLength.
+//   User side: DeviceIoControl returns TRUE with lpBytesReturned = size,
+//   read data lives in the output buffer as-is. Standard contract, unlike
+//   Corsair's "value comes back via lpBytesReturned" trick.
+//
+// Trade-offs vs. Corsair we shipped before:
+//   + 64-bit PA (Corsair capped at 32-bit; forced CR3 scan under 4 GB
+//     and legitimately missed high-PA kernel PT pages on 32 GB systems)
+//   + Bulk reads: one IOCTL can fill an entire 4 KB page or larger
+//     (Corsair needed 1024 DWORD IOCTLs per page). Cuts kernel round-trips
+//     by ~1000× on cold-page fills — massive perf win on the CS2 cache
+//     thread.
+//   + No integrity-level gate on CREATE (Corsair required IL >= HIGH;
+//     NTIOLib takes any admin who passes the device DACL)
+//   - Requires one-shot ARM IOCTL (0xC3502000) after Open() before reads
+//     work. Handled once in Open()'s probe.
+//   - Device path \Device\NTIOLib_CC_COMM is a known IOC in AC/AV static
+//     scanners. Mitigation: idle-mode reopen keeps the handle out of the
+//     process handle table between scans; the .sys on disk is renamed to
+//     a machine-stable hex; the SCM service name is likewise stable-hex.
+#define IOCTL_NTIO_ARM                  0xC3502000u
+#define IOCTL_NTIO_READ_PHYS            0xC3506104u
+#define IOCTL_NTIO_WRITE_PHYS           0xC350A148u
+#define NTIO_ARM_MAGIC                  0x2F405A34u
 
 #pragma pack(push, 1)
-struct CllReadReq {
-    uint32_t phys_lo;                  // IN — low 32 bits of physical address
-    uint32_t phys_hi;                  // IN — must be 0 (driver ignores it on read)
-    uint16_t size;                     // IN — must be 1, 2, or 4
-    uint16_t pad;                      // IN — zero
+struct NtioReadReq {
+    uint64_t phys_addr;                // IN — full 64-bit physical address
+    uint32_t unit_size;                // IN — 1, 2, or 4
+    uint32_t count;                    // IN — number of units to read
 };
-static_assert(sizeof(CllReadReq) == 0x0C, "CLL read req size");
+static_assert(sizeof(NtioReadReq) == 0x10, "NTIOLib read req size");
 #pragma pack(pop)
 
-// Corsair IOCTL 0x229350 return-contract summary (from disassembly):
+// NTIOLib IOCTL 0xC3506104 return-contract summary (from disassembly):
 //
 //   Path                                     IoStatus.Status       Information
-//   Success (byte/word/dword read)           STATUS_SUCCESS  (0)   = read value
-//   MmMapIoSpace fail                        STATUS_INSUFFICIENT_  0
-//                                              RESOURCES (0xC0000017)
-//   size not in {1,2,4}                      STATUS_INVALID_       (unchanged)
+//   Success (any unit_size*count read)       STATUS_SUCCESS  (0)   = size
+//   MmMapIoSpace fail (bad PA / refused)     STATUS_UNSUCCESSFUL   0
+//                                              (0xC0000001)
+//   InputBufferLength != 0x10                STATUS_INVALID_       0
 //                                              PARAMETER (0xC000000D)
-//   OutputLength < 10                        STATUS_INVALID_       0
-//                                              BUFFER_SIZE (0xC0000023)
-//   InputLength < size (read)                same as above         0
-//   IRP_MJ_CREATE integrity < HIGH           STATUS_ACCESS_DENIED  (n/a: refused earlier)
+//   OutputBufferLength < unit_size*count     same as above         0
+//   Global magic not armed (call ARM first)  STATUS_UNSUCCESSFUL   0
+//   PA upper 16 bits > 0xFEDC (sanity)       STATUS_UNSUCCESSFUL   0
 //
 // Win32 mapping seen at DeviceIoControl (ok=FALSE, err= these):
-//   0xC0000017 INSUFFICIENT_RESOURCES → err = 8   (ERROR_NOT_ENOUGH_MEMORY)
+//   0xC0000001 UNSUCCESSFUL           → err = 31   (ERROR_GEN_FAILURE)
 //   0xC000000D INVALID_PARAMETER      → err = 87
-//   0xC0000023 INVALID_BUFFER_SIZE    → err = 24  (ERROR_BAD_LENGTH)
-//   0xC0000022 ACCESS_DENIED          → err = 5   (integrity or DACL)
-//   Handle broken                    → err = 6   (INVALID_HANDLE)
-//   Kernel low resources              → err = 1450 (NO_SYSTEM_RESOURCES)
-//
-// On success DeviceIoControl also puts the read value in `lpBytesReturned`.
-// We ignore the `out` buffer contents and take the value from there.
+//   0xC0000023 INVALID_BUFFER_SIZE    → err = 24
+//   0xC0000022 ACCESS_DENIED          → err = 5    (DACL rejects; not a runtime fail)
+//   Handle broken                    → err = 6
+//   Kernel low resources              → err = 1450
 enum class SivFail : uint8_t {
     Ok            = 0,   // read succeeded
     BadArgs       = 1,   // caller violated preconditions (size or ptr)
@@ -134,26 +149,27 @@ public:
         return instance;
     }
 
-    // Set the device path before Open(). Corsair's driver builds its
-    // \Device\<name> at runtime from the service name (see the header
-    // comment above), and our service name is machine-stable (see
-    // main.cpp's GetSvcName()), so main.cpp computes both once and hands
-    // them to us. Length-limited to keep the fallback GLOBALROOT and \?
-    // variants short and stack-buildable.
-    void SetDevicePath(const char* userModePath) {
-        if (!userModePath) return;
-        size_t n = strnlen(userModePath, sizeof(m_devicePath) - 1);
-        memcpy(m_devicePath, userModePath, n);
-        m_devicePath[n] = '\0';
+    // NTIOLib hardcodes its \Device\NTIOLib_CC_COMM UNICODE_STRING at
+    // DriverEntry (verified against .rdata @ 0x140001af0). The user-mode
+    // path is fixed and cannot be renamed without patching the signed
+    // driver and breaking the WHCP signature. What we CAN control:
+    //   - The SCM service name (main.cpp GetSvcName — machine-stable hex)
+    //   - The on-disk .sys filename (main.cpp GetDriverPath)
+    //   - Handle visibility (idle-mode reopen keeps our process handle
+    //     table clean of \Device\NTIOLib_CC_COMM between IOCTL bursts)
+    // SetDevicePath is kept for API compatibility but is now a no-op —
+    // the device path is a constant. Callers should stop invoking it.
+    void SetDevicePath(const char* /*userModePath*/) {
+        // no-op — device path is hardcoded in the signed driver.
     }
     const char* GetDevicePath() const {
-        return m_devicePath[0] ? m_devicePath : "\\\\.\\CorsairLLAccess";
+        return "\\\\.\\NTIOLib_CC_COMM";
     }
 
 
     bool Open() {
         if (IsOpen()) return true;
-        DBG_PRINT("[cll] Opening device...\n");
+        DBG_PRINT("[ntio] Opening device...\n");
         // Try each (path, access) pair. First success wins.
         //   - GENERIC_READ|WRITE:       normal admin access
         //   - GENERIC_READ:             device with read-only DACL
@@ -161,15 +177,7 @@ public:
         //   - GLOBALROOT / global path: session-isolation fallback
         // Retries ERROR_FILE_NOT_FOUND (symlink publish race) up to 10x.
         const char* base = GetDevicePath();
-
-        // Derive the two alternate spellings without heap allocation.
-        // Base looks like "\\.\<name>"; extract <name> after "\\.\".
-        const char* leaf = base;
-        if (strncmp(base, "\\\\.\\", 4) == 0) leaf = base + 4;
-
-        char pathGlobal[128] = {};
-        snprintf(pathGlobal, sizeof(pathGlobal),
-                 "\\\\.\\GLOBALROOT\\Device\\%s", leaf);
+        const char* pathGlobal = "\\\\.\\GLOBALROOT\\Device\\NTIOLib_CC_COMM";
 
         struct Attempt { const char* path; DWORD access; };
         Attempt attempts[] = {
@@ -196,31 +204,38 @@ public:
             Sleep(100);
         }
         if (m_hDevice == INVALID_HANDLE_VALUE) {
-            DBG_PRINT("[cll] Failed to open device: err=%lu\n", lastErr);
-            if (lastErr == 2)      DBG_PRINT("[cll]   (device not found -- driver not loaded or bad service name)\n");
-            else if (lastErr == 5) DBG_PRINT("[cll]   (access denied -- token integrity < HIGH, or DACL blocks)\n");
+            DBG_PRINT("[ntio] Failed to open device: err=%lu\n", lastErr);
+            if (lastErr == 2)      DBG_PRINT("[ntio]   (device not found -- driver not loaded or bad service name)\n");
+            else if (lastErr == 5) DBG_PRINT("[ntio]   (access denied -- token DACL rejects; not elevated?)\n");
             return false;
         }
-        DBG_PRINT("[cll] Device opened: handle=0x%p\n", (void*)m_hDevice);
+        DBG_PRINT("[ntio] Device opened: handle=0x%p\n", (void*)m_hDevice);
 
-        // Probe IOCTL 0x229350 at PA=0x1000 with a 4-byte read. Corsair's
-        // primitive is byte/word/dword only, so we use size=4 to prove
-        // dispatch works end-to-end (input validation + MmMapIoSpace succeed
-        // + read value comes back via lpBytesReturned).
-        uint32_t probe = 0;
-        bool ok = CllReadOnce(0x1000, 4, probe);
-
-        if (!ok) {
-            printf(skCrypt("[SysMonitor] CLL probe FAILED (err=%lu) -- driver up but IOCTL 0x229350 blocked\n"),
+        // Step 1: arm the driver. NTIOLib gates all read/write IOCTLs
+        // behind a global magic (0x2F405A34) that must be set exactly once
+        // via IOCTL_NTIO_ARM. Without this the probe returns UNSUCCESSFUL.
+        if (!NtioArm(m_hDevice)) {
+            printf(skCrypt("[SysMonitor] NTIOLib ARM failed (err=%lu) -- driver present but ARM IOCTL rejected\n"),
                    GetLastError());
-            // Fail Open() so Engine::Init doesn't proceed with a broken
-            // read path. Downstream cascade through CR3 resolution / module
-            // discovery gives no clear diagnostic; failing here does.
             CloseHandle(m_hDevice);
             m_hDevice = INVALID_HANDLE_VALUE;
             return false;
         }
-        printf(skCrypt("[SysMonitor] CLL probe OK  PA=0x1000 dword -> 0x%08X\n"),
+
+        // Step 2: probe the bulk read primitive at PA=0x1000 with a 4-byte
+        // dword read. Exercises the full path (input validation + activation
+        // gate + MmMapIoSpace succeed + rep movs into output buffer).
+        uint32_t probe = 0;
+        bool ok = NtioReadOnce(0x1000, 4, 1, &probe, sizeof(probe));
+
+        if (!ok) {
+            printf(skCrypt("[SysMonitor] NTIOLib probe FAILED (err=%lu) -- driver up + armed but IOCTL 0xC3506104 blocked\n"),
+                   GetLastError());
+            CloseHandle(m_hDevice);
+            m_hDevice = INVALID_HANDLE_VALUE;
+            return false;
+        }
+        printf(skCrypt("[SysMonitor] NTIOLib probe OK  PA=0x1000 dword -> 0x%08X\n"),
                (unsigned)probe);
         return true;
     }
@@ -878,10 +893,10 @@ public:
     }
 
     // Direct physical read — bypasses the page cache.
-    // Under Corsair, SivReadPhys already handles size-1/2/4 chunking + PA
-    // alignment internally, so this is just a straight forward. Kept as a
-    // separate entry point so PhysRead()'s small-read path can bypass the
-    // LRU slot fill without special-casing the caller.
+    // Under NTIOLib, SivReadPhys already picks the best unit_size/count
+    // tuple internally, so this is a straight forward. Kept as a separate
+    // entry point so PhysRead()'s small-read path can bypass the LRU slot
+    // fill without special-casing the caller.
     bool ReadPhysDirect(uint64_t physAddr, void* buffer, size_t size) {
         return SivReadPhys(physAddr, buffer, size);
     }
@@ -1020,38 +1035,50 @@ private:
         if (idx >= (size_t)kFailLogSlots) return;
         int n = m_failLogCounts[idx].fetch_add(1, std::memory_order_relaxed);
         if (n < kIoFailLogCap) {
-            printf(skCrypt("[SysMonitor] CLL IOCTL 0x229350 failed: %s  pa=0x%llX  size=%u  returned=%u  err=%lu\n"),
+            printf(skCrypt("[SysMonitor] NTIOLib IOCTL 0xC3506104 failed: %s  pa=0x%llX  bytes=%u  returned=%u  err=%lu\n"),
                    SivFailName(cls),
                    (unsigned long long)pa,
                    (unsigned)size,
                    (unsigned)returned,
                    (unsigned long)err);
         } else if (n == kIoFailLogCap) {
-            printf(skCrypt("[SysMonitor] CLL IOCTL 0x229350: further %s failures suppressed (cap=%d)\n"),
+            printf(skCrypt("[SysMonitor] NTIOLib IOCTL 0xC3506104: further %s failures suppressed (cap=%d)\n"),
                    SivFailName(cls), kIoFailLogCap);
         }
     }
 
-    // Single 1/2/4-byte physical read via Corsair IOCTL 0x229350.
-    // Driver contract (verified @ 0x14000185c):
-    //   - Input: CllReadReq (12 bytes) — phys_lo, phys_hi=0, size ∈ {1,2,4}
-    //   - Output: DeviceIoControl's `lpBytesReturned` holds the read value
-    //     (IoStatus.Information IS the payload — the OutputBuffer is used
-    //     only to satisfy the OutputLength ≥ 10 gate; its contents are
-    //     undefined on success).
+    // Arm the driver's activation gate. NTIOLib requires ONE call of
+    // IOCTL_NTIO_ARM with the magic 0x2F405A34 word in the buffer before
+    // any read/write IOCTL is dispatched. Once armed the global stays set
+    // for the driver's lifetime. Called once from Open() before the probe.
+    bool NtioArm(HANDLE h) {
+        uint32_t buf = NTIO_ARM_MAGIC;
+        DWORD    returned = 0;
+        BOOL     ok = DeviceIoControl(h, IOCTL_NTIO_ARM,
+                                      &buf, sizeof(buf),
+                                      &buf, sizeof(buf),
+                                      &returned, nullptr);
+        return ok != FALSE;
+    }
+
+    // Bulk physical read via NTIOLib IOCTL 0xC3506104. One IOCTL fills up
+    // to unit_size*count bytes in the caller-supplied output buffer.
+    // Contract (verified against dispatch handler @ 0x1400013ac):
+    //   in  = NtioReadReq{phys_addr, unit_size ∈ {1,2,4}, count}
+    //   out = unit_size*count raw bytes copied from the mapped PA range
+    //   driver: MmMapIoSpace(PA, size, MmNonCached) → rep movs → unmap
     //
-    // We synthesise 8/16/N-byte reads in SivReadPhys by chaining DWORD
-    // IOCTLs. Idle mode still reopens the handle per call to keep the
-    // process handle table clean between scans.
-    //
-    // Failure discipline (same shape as before):
+    // Failure discipline: same shape as before —
     //   - Transient (err=1450) → retry once
     //   - Pipe-death (err=5/6, handle-failed) → count toward breaker
     //   - Per-PA rejections (MmMapIoSpace refused a specific address) →
     //     reset streak; the driver is alive, this address just isn't mappable
-    bool CllReadOnce(uint64_t physAddr, uint16_t size, uint32_t& out_val) {
-        if (size != 1 && size != 2 && size != 4) return false;
-        if ((physAddr >> 32) != 0)               return false;  // driver drops upper bits
+    bool NtioReadOnce(uint64_t physAddr, uint32_t unit_size, uint32_t count,
+                      void* out_data, size_t out_capacity) {
+        if (unit_size != 1 && unit_size != 2 && unit_size != 4) return false;
+        if (!count || !out_data)                                return false;
+        size_t bytes = (size_t)unit_size * count;
+        if (bytes > out_capacity)                               return false;
 
         if (m_ioBroken.load(std::memory_order_acquire)) return false;
 
@@ -1065,48 +1092,49 @@ private:
                                         FILE_SHARE_READ | FILE_SHARE_WRITE,
                                         nullptr, OPEN_EXISTING,
                                         FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (m_hDevice != INVALID_HANDLE_VALUE) {
+                    // Fresh handle → re-arm before first IOCTL. Armed state
+                    // lives in the driver's global, not the handle, so this
+                    // is a no-op if we're merely reopening a device that
+                    // was already armed by an earlier session; but the
+                    // magic-write is cheap and idempotent.
+                    NtioArm(m_hDevice);
+                }
                 ownedOpen = (m_hDevice != INVALID_HANDLE_VALUE);
             }
             hUse = m_hDevice;
             LeaveCriticalSection(&m_physLock);
             if (hUse == INVALID_HANDLE_VALUE) {
-                NoteSivFail(SivFail::HandleFailed, physAddr, size, 0, GetLastError());
+                NoteSivFail(SivFail::HandleFailed, physAddr, (DWORD)bytes, 0, GetLastError());
                 return false;
             }
         } else {
             hUse = m_hDevice;
         }
 
-        CllReadReq req{};
-        req.phys_lo = (uint32_t)physAddr;
-        req.phys_hi = 0;
-        req.size    = size;
-        req.pad     = 0;
-
-        // OutputLength ≥ 10 gate. The driver never writes into OutputBuffer
-        // for reads — the value comes back via IoStatus.Information — but
-        // we still need to satisfy the size check. A stack DWORD would be
-        // too small; use a small local sized to CLL_BUF_SIZE.
-        uint8_t out_scratch[CLL_BUF_SIZE] = {};
+        NtioReadReq req{};
+        req.phys_addr = physAddr;
+        req.unit_size = unit_size;
+        req.count     = count;
 
         DWORD returned = 0;
-        BOOL  ok = DeviceIoControl(hUse, IOCTL_CLL_READ_PHYS,
+        BOOL  ok = DeviceIoControl(hUse, IOCTL_NTIO_READ_PHYS,
                                    &req, sizeof(req),
-                                   out_scratch, sizeof(out_scratch),
+                                   out_data, (DWORD)bytes,
                                    &returned, nullptr);
 
-        // Corsair's Ok criterion: DeviceIoControl returned TRUE. `returned`
-        // is the read value itself, not a byte count — so the SIV-style
-        // `returned == size` gate does not apply here.
         SivFail cls;
-        if (ok != FALSE) {
+        if (ok != FALSE && returned == (DWORD)bytes) {
             cls = SivFail::Ok;
+        } else if (ok != FALSE) {
+            cls = SivFail::PartialReturn;
         } else {
             DWORD err = GetLastError();
             switch (err) {
                 case 5:                                cls = SivFail::IoctlDenied;   break;
                 case 6:                                cls = SivFail::HandleStale;   break;
-                case 1: case 24: case 87: case 8:      cls = SivFail::IoctlRejected; break;
+                case 1: case 24: case 87: case 8: case 31:
+                                                       cls = SivFail::IoctlRejected; break;
                 case 1450:                             cls = SivFail::Transient;     break;
                 default:                               cls = SivFail::UnknownError;  break;
             }
@@ -1115,11 +1143,11 @@ private:
         if (cls == SivFail::Transient) {
             Sleep(0);
             returned = 0;
-            ok = DeviceIoControl(hUse, IOCTL_CLL_READ_PHYS,
+            ok = DeviceIoControl(hUse, IOCTL_NTIO_READ_PHYS,
                                  &req, sizeof(req),
-                                 out_scratch, sizeof(out_scratch),
+                                 out_data, (DWORD)bytes,
                                  &returned, nullptr);
-            if (ok != FALSE) cls = SivFail::Ok;
+            if (ok != FALSE && returned == (DWORD)bytes) cls = SivFail::Ok;
         }
 
         if (ownedOpen) {
@@ -1129,17 +1157,16 @@ private:
         }
 
         if (cls == SivFail::Ok) {
-            out_val = returned;
             m_ioFailStreak.store(0, std::memory_order_release);
             return true;
         }
 
-        NoteSivFail(cls, physAddr, size, returned, GetLastError());
+        NoteSivFail(cls, physAddr, (DWORD)bytes, returned, GetLastError());
         if (IsPipeDeath(cls)) {
             int streak = m_ioFailStreak.fetch_add(1, std::memory_order_acq_rel) + 1;
             if (streak >= kIoFailStreakBreaker) {
                 if (!m_ioBroken.exchange(true, std::memory_order_acq_rel)) {
-                    printf(skCrypt("[SysMonitor] Corsair driver pipe dead (%d consecutive %s failures) — fast-failing further reads. Reset via WinDrvReader::Get().ResetIoBreaker() after re-loading.\n"),
+                    printf(skCrypt("[SysMonitor] NTIOLib pipe dead (%d consecutive %s failures) — fast-failing further reads. Reset via WinDrvReader::Get().ResetIoBreaker() after re-loading.\n"),
                            streak, SivFailName(cls));
                 }
             }
@@ -1149,79 +1176,62 @@ private:
         return false;
     }
 
-    // Arbitrary-size physical read layered on top of CllReadOnce.
-    // The driver only supports 1/2/4-byte primitives, so we chain DWORDs
-    // and use size-2 / size-1 fills for the trailing 1..3 bytes. Keeps
-    // the caller-visible signature identical to the SIV era.
+    // Arbitrary-size physical read via NTIOLib's bulk primitive.
+    // One IOCTL fills the whole request in a single kernel round-trip
+    // (verified against the read handler @ 0x1400013ac which uses
+    // rep movsb/w/d inside kernel to copy from the mapped range).
+    // 64-bit PA supported — no 4 GB ceiling like the Corsair era.
     bool SivReadPhys(uint64_t physAddr, void* out, size_t size) {
         if (!out || size == 0) {
             NoteSivFail(SivFail::BadArgs, physAddr, (DWORD)size, 0, 0);
             return false;
         }
-        if ((physAddr + size - 1) >> 32) {
-            // Corsair's IOCTL 0x229350 caps PAs at 32 bits. On the ESP hot
-            // path CR3 candidates and kernel PT pages sit well under 4 GB,
-            // so this only triggers on genuinely out-of-range requests.
+        // NTIOLib's PA sanity check rejects addresses whose top 16 bits
+        // exceed 0xFEDC (verified @ 0x1400013f7). That leaves ~255 TB of
+        // usable PA space — plenty of headroom for anything short of a
+        // kernel-VA-shaped garbage value.
+        if (((physAddr + size - 1) >> 48) > 0xFEDCULL) {
             NoteSivFail(SivFail::BadArgs, physAddr, (DWORD)size, 0, 0);
             return false;
         }
 
-        uint8_t* dst = reinterpret_cast<uint8_t*>(out);
-        size_t   done = 0;
-        while (done < size) {
-            size_t   remain = size - done;
-            uint64_t pa     = physAddr + done;
-            uint32_t val    = 0;
-
-            if (remain >= 4 && (pa & 3ULL) == 0) {
-                if (!CllReadOnce(pa, 4, val)) return false;
-                memcpy(dst + done, &val, 4);
-                done += 4;
-            } else if (remain >= 2 && (pa & 1ULL) == 0) {
-                if (!CllReadOnce(pa, 2, val)) return false;
-                uint16_t v16 = (uint16_t)val;
-                memcpy(dst + done, &v16, 2);
-                done += 2;
-            } else {
-                if (!CllReadOnce(pa, 1, val)) return false;
-                dst[done] = (uint8_t)val;
-                done += 1;
-            }
+        // Pick the largest unit_size that both PA and size align to. This
+        // keeps `rep movs` in the kernel handler on its fast dword path.
+        uint32_t unit;
+        uint32_t count;
+        if ((physAddr & 3ULL) == 0 && (size & 3ULL) == 0) {
+            unit = 4; count = (uint32_t)(size / 4);
+        } else if ((physAddr & 1ULL) == 0 && (size & 1ULL) == 0) {
+            unit = 2; count = (uint32_t)(size / 2);
+        } else {
+            unit = 1; count = (uint32_t)size;
         }
-        return true;
+        return NtioReadOnce(physAddr, unit, count, out, size);
     }
 
-    // Fills a 4KB physical page. Corsair's primitive caps at 4-byte reads,
-    // so this costs 1024 DWORD IOCTLs per page (same order as the WDTKernel
-    // era). CS2's hot working set is largely served by the 128-slot LRU in
-    // PhysRead(), so the per-page cost only bites on cold misses.
+    // Fills a 4 KB physical page. NTIOLib supports the whole page in one
+    // IOCTL — massive improvement over Corsair's 1024-DWORD cost per page.
     bool SivReadPage(uint64_t pagePA, uint8_t out[4096]) {
         pagePA &= ~0xFFFULL;
         if (!out || reinterpret_cast<uintptr_t>(out) < 0x10000ULL) return false;
 
-        // Corsair's IOCTL 0x229350 caps PAs at 32 bits — reject page-aligned
-        // PAs beyond 4 GB up front to avoid 1024 wasted IOCTLs.
-        if (pagePA + 0xFFFULL >> 32) return false;
+        // Same PA-sanity gate as the driver (top 16 bits ≤ 0xFEDC).
+        if (((pagePA + 0xFFFULL) >> 48) > 0xFEDCULL) return false;
 
         // PA blacklist: skip pages that have failed before. Miss once, skip forever.
         for (int i = 0; i < kBadPaCount; i++)
             if (m_badPAs[i] && m_badPAs[i] == pagePA) return false;
 
-        // Serialise so one thread's DWORD stream isn't interleaved with
-        // another's. Not strictly required for correctness (each IOCTL is
-        // self-contained) but keeps driver-side mapping-cache locality clean.
+        // Serialise so one thread's IOCTL isn't interleaved with another's.
+        // Not strictly required for correctness (each IOCTL is self-contained)
+        // but keeps driver-side MmMapIoSpace locality clean.
         EnterCriticalSection(&m_ioctlLock);
-        bool ok = true;
-        for (uint32_t off = 0; off < 4096; off += 4) {
-            uint32_t val = 0;
-            if (!CllReadOnce(pagePA + off, 4, val)) { ok = false; break; }
-            memcpy(out + off, &val, 4);
-        }
+        bool ok = NtioReadOnce(pagePA, 4, 1024, out, 4096);
         if (!ok) {
             static bool s_logged = false;
             if (!s_logged) {
                 s_logged = true;
-                printf(skCrypt("[SysMonitor] CLL page read failed: err=%lu (PA=0x%llX)\n"),
+                printf(skCrypt("[SysMonitor] NTIOLib page read failed: err=%lu (PA=0x%llX)\n"),
                        GetLastError(), (unsigned long long)pagePA);
             }
             m_badPAs[m_badPaHead] = pagePA;
@@ -1587,11 +1597,7 @@ private:
 
     bool            m_idleMode         = false;
     HANDLE          m_hDevice          = INVALID_HANDLE_VALUE;
-    // Device path — set by main.cpp via SetDevicePath() before Open() so
-    // the runtime can match whatever service name we registered. Corsair
-    // builds \Device\<svcname> at load, so keeping this in sync is what
-    // makes the driver openable at all.
-    char            m_devicePath[64]   = {};
+    // (Device path is hardcoded — see GetDevicePath. m_devicePath removed.)
     uint64_t        m_kernelBase       = 0;
     uint64_t        m_kernelPA         = 0;
     uint64_t        m_systemCr3        = 0;

@@ -1058,6 +1058,9 @@ void Menu::RenderImpl()
         ZukToggle(skCrypt("Health Number"), &cfg::esp::health_number);
         ZukToggle(skCrypt("Armor Bar"),     &cfg::esp::armor);
         ZukToggle(skCrypt("Show Team"),     &cfg::esp::team);
+        ZukToggle(skCrypt("Only Spotted"),  &cfg::esp::spotted);
+        ZukToggle(skCrypt("Spotted Color"), &cfg::esp::spotted_color,
+                  &cfg::esp::colors::box_spotted);
         ImGui::EndChild();
 
         ImGui::SetCursorPos({kSideW + kCol3, kTopH + slide});
@@ -1113,6 +1116,17 @@ void Menu::RenderImpl()
         Section(skCrypt("OVERLAY"));
         ZukToggle(skCrypt("Crosshair"),      &cfg::world::crosshair::enabled);
         ZukToggle(skCrypt("Velocity Graph"), &cfg::world::velocity::enabled);
+        if (cfg::world::velocity::enabled) {
+            ImGui::Indent(12.f);
+            static float _velRate  = (float)cfg::world::velocity::sample_rate;
+            static float _velLen   =        cfg::world::velocity::sample_length;
+            _velRate = (float)cfg::world::velocity::sample_rate;
+            if (ZukSlider(skCrypt("Sample Rate"),   &_velRate, 5.f, 120.f, skCrypt("%.0fHZ")))
+                cfg::world::velocity::sample_rate = (int)_velRate;
+            if (ZukSlider(skCrypt("Sample Length"), &_velLen,  1.f,  10.f, skCrypt("%.1fS")))
+                cfg::world::velocity::sample_length = _velLen;
+            ImGui::Unindent(12.f);
+        }
         ImGui::EndChild();
     }
     else {
