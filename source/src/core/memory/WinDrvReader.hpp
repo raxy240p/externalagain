@@ -251,6 +251,7 @@ public:
     void ResetIoBreaker() {
         m_ioBroken.store(false, std::memory_order_release);
         m_ioFailStreak.store(0, std::memory_order_release);
+        m_armed.store(false, std::memory_order_release);
         for (auto& c : m_failLogCounts) c.store(0, std::memory_order_release);
     }
 
@@ -1049,15 +1050,21 @@ private:
 
     // Arm the driver's activation gate. NTIOLib requires ONE call of
     // IOCTL_NTIO_ARM with the magic 0x2F405A34 word in the buffer before
-    // any read/write IOCTL is dispatched. Once armed the global stays set
-    // for the driver's lifetime. Called once from Open() before the probe.
+    // any read/write IOCTL is dispatched. The gate is a DRIVER-GLOBAL
+    // (persists across handle closes; only clears on driver unload), so
+    // once we've armed it in this driver session further ARM calls are
+    // redundant syscalls on the hot read path. m_armed tracks that state.
+    // ResetIoBreaker (called on driver reload) also resets this so the
+    // next Open re-arms cleanly.
     bool NtioArm(HANDLE h) {
+        if (m_armed.load(std::memory_order_acquire)) return true;
         uint32_t buf = NTIO_ARM_MAGIC;
         DWORD    returned = 0;
         BOOL     ok = DeviceIoControl(h, IOCTL_NTIO_ARM,
                                       &buf, sizeof(buf),
                                       &buf, sizeof(buf),
                                       &returned, nullptr);
+        if (ok != FALSE) m_armed.store(true, std::memory_order_release);
         return ok != FALSE;
     }
 
@@ -1637,5 +1644,10 @@ private:
     static constexpr int  kFailLogSlots        = 9;
     std::atomic<int>      m_ioFailStreak       {0};
     std::atomic<bool>     m_ioBroken           {false};
+    // NTIOLib activation-gate cache. Set true after the first successful
+    // IOCTL_NTIO_ARM in this driver session; cleared by ResetIoBreaker
+    // (which is called on Engine::Init after driver reload). Skips the
+    // redundant ARM syscall on every idle-mode reopen.
+    std::atomic<bool>     m_armed              {false};
     std::atomic<int>      m_failLogCounts[kFailLogSlots] {};
 };
