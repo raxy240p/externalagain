@@ -1020,14 +1020,14 @@ private:
         if (idx >= (size_t)kFailLogSlots) return;
         int n = m_failLogCounts[idx].fetch_add(1, std::memory_order_relaxed);
         if (n < kIoFailLogCap) {
-            printf(skCrypt("[SysMonitor] SIV IOCTL 0x10 failed: %s  pa=0x%llX  size=%u  returned=%u  err=%lu\n"),
+            printf(skCrypt("[SysMonitor] CLL IOCTL 0x229350 failed: %s  pa=0x%llX  size=%u  returned=%u  err=%lu\n"),
                    SivFailName(cls),
                    (unsigned long long)pa,
                    (unsigned)size,
                    (unsigned)returned,
                    (unsigned long)err);
         } else if (n == kIoFailLogCap) {
-            printf(skCrypt("[SysMonitor] SIV IOCTL 0x10: further %s failures suppressed (cap=%d)\n"),
+            printf(skCrypt("[SysMonitor] CLL IOCTL 0x229350: further %s failures suppressed (cap=%d)\n"),
                    SivFailName(cls), kIoFailLogCap);
         }
     }

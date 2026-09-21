@@ -40,7 +40,11 @@ bool Engine::InitImpl() {
         printf(skCrypt("[SysMonitor] Failed to open device\n"));
         return false;
     }
-    printf(skCrypt("[SysMonitor] SIV driver ready\n"));
+    printf(skCrypt("[SysMonitor] CLL driver ready\n"));
+
+    // Fresh Engine::Init — clear any latched breaker/log state so a previous
+    // startup attempt or user-triggered reload starts clean.
+    drv.ResetIoBreaker();
 
     process = std::make_shared<pProcess>();
 

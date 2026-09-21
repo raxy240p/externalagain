@@ -337,17 +337,24 @@ static const char* DecodeStartErr(DWORD err) {
         case 32:   return "sharing violation — the sys file is in use, close and retry";
         case 87:   return "invalid parameter — CreateService args rejected";
         case 577:  return "ERROR_INVALID_IMAGE_HASH — driver blocklist rejected the signature";
+        case 1072: return "service marked for deletion — SCM still finalising, retry momentarily";
+        case 1073: return "service already exists under a different config";
         case 1275: return "ERROR_DRIVER_BLOCKED — blocklist / code integrity refused load";
         case 1058: return "service disabled";
-        case 1073: return "service already exists under a different config";
         case 1450: return "no system resources (file may be delete-pending, wait and retry)";
         default:   return "";
     }
 }
 
 static bool StartDriver() {
-    if (IsDriverLoaded()) return true;
-
+    // No early "device already open, skip everything" shortcut here on
+    // purpose. dj's spec: "if already opened kill it, start the same
+    // service/device/driver again". Every invocation walks the self-healing
+    // lifecycle — stop any pre-existing instance, delete its service,
+    // recreate ours, start it — so we never inherit hidden state from a
+    // previous session, a crashed run, or another cheat that happened to
+    // land on the same machine-stable service name.
+    //
     // SCM APIs live in advapi32.dll. It's not necessarily loaded yet at this
     // point (static CRT + no direct advapi32 references), so ResolveExport
     // would return nullptr and the first call would crash silently.
@@ -386,6 +393,21 @@ static bool StartDriver() {
     // (CorsairLLAccess64.sys reads no Parameters values at DriverEntry —
     // device creation is unconditional, so no pre-start registry writes needed.)
 
+    // Validate the on-disk image BEFORE tearing down any existing service so
+    // we don't leave dj without a working service AND without a valid file.
+    if (GetFileAttributesA(drvPath) == INVALID_FILE_ATTRIBUTES) {
+        std::cout << "[!] Driver file not found at: " << drvPath << "\n";
+        std::cout << "    Copy CorsairLLAccess64.sys to that path and retry.\n";
+        pCloseServiceHandle(hSCM);
+        return false;
+    }
+    if (!ValidateDriverFile(drvPath)) {
+        std::cout << "[!] Driver file at " << drvPath << " is not a valid PE image.\n";
+        std::cout << "    Re-copy CorsairLLAccess64.sys to that path.\n";
+        pCloseServiceHandle(hSCM);
+        return false;
+    }
+
     // Reuse existing service entry after reboot — avoids Event ID 7045 on every launch.
     SC_HANDLE hExist = pOpenServiceA(hSCM, svcName, SERVICE_ALL_ACCESS);
     if (hExist) {
@@ -414,30 +436,39 @@ static bool StartDriver() {
         }
         pDeleteService(hExist);
         pCloseServiceHandle(hExist);
-        Sleep(300);   // Let SCM release the image file before the fresh create.
+
+        // Poll for the deletion to actually finalize. SCM marks the service
+        // for deletion and only frees the name once every handle is closed
+        // AND its image is unmapped from the kernel. A blind Sleep(300) is
+        // often enough but the drop-and-recreate path here can race on
+        // slower boxes; poll up to ~2 s and any subsequent CreateService
+        // ERROR_SERVICE_MARKED_FOR_DELETE is retried below.
+        for (int i = 0; i < 20; i++) {
+            SC_HANDLE hChk = pOpenServiceA(hSCM, svcName, SERVICE_QUERY_STATUS);
+            if (!hChk) break;                       // truly gone — good
+            pCloseServiceHandle(hChk);
+            Sleep(100);
+        }
     }
 
-    if (GetFileAttributesA(drvPath) == INVALID_FILE_ATTRIBUTES) {
-        std::cout << "[!] Driver file not found at: " << drvPath << "\n";
-        std::cout << "    Copy CorsairLLAccess64.sys to that path and retry.\n";
-        pCloseServiceHandle(hSCM);
-        return false;
+    // Create the service. Retry ERROR_SERVICE_MARKED_FOR_DELETE (1072) for
+    // up to ~2 s — the delete above was polled, but a leftover kernel-side
+    // image reference can keep the name blocked briefly on slower SCMs.
+    SC_HANDLE hSvc = nullptr;
+    DWORD     eCreate = 0;
+    for (int i = 0; i < 20 && !hSvc; i++) {
+        hSvc = pCreateServiceA(hSCM, svcName, svcName,
+            SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER,
+            SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
+            drvPath, nullptr, nullptr, nullptr, nullptr, nullptr);
+        if (hSvc) break;
+        eCreate = pGetLastError();
+        if (eCreate != 1072) break;                 // only retry marked-for-delete
+        Sleep(100);
     }
-    if (!ValidateDriverFile(drvPath)) {
-        std::cout << "[!] Driver file at " << drvPath << " is not a valid PE image.\n";
-        std::cout << "    Re-copy CorsairLLAccess64.sys to that path.\n";
-        pCloseServiceHandle(hSCM);
-        return false;
-    }
-
-    SC_HANDLE hSvc = pCreateServiceA(hSCM, svcName, svcName,
-        SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER,
-        SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
-        drvPath, nullptr, nullptr, nullptr, nullptr, nullptr);
     if (!hSvc) {
-        DWORD e = pGetLastError();
-        const char* hint = DecodeStartErr(e);
-        std::cout << "[!] CreateService failed (err=" << e << ")";
+        const char* hint = DecodeStartErr(eCreate);
+        std::cout << "[!] CreateService failed (err=" << eCreate << ")";
         if (*hint) std::cout << " — " << hint;
         std::cout << "\n";
         pCloseServiceHandle(hSCM);
@@ -520,9 +551,9 @@ static void StopDriver() {
 // Enable admin-available-but-disabled-by-default privileges on the current
 // process token.
 //
-// CorsairLLAccess64's IRP_MJ_CREATE does NOT gate on SeLoadDriverPrivilege
-// (that was SIVX64's gate). It checks the caller's token integrity level and
-// rejects anything below SECURITY_MANDATORY_HIGH_RID (0x3000). Running from
+// CorsairLLAccess64's IRP_MJ_CREATE does NOT gate on SeLoadDriverPrivilege.
+// It checks the caller's token integrity level and rejects anything below
+// SECURITY_MANDATORY_HIGH_RID (0x3000). Running from
 // an elevated cmd (Admin group + UAC-elevated) satisfies that at High IL by
 // default, so this helper is not strictly required for Corsair — kept here
 // because enabling SeDebug/SeSecurity/etc. is still useful for other paths
