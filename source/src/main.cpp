@@ -23,7 +23,7 @@
 // ── Per-machine hardware fingerprint ─────────────────────────────────────────
 // Mixes volume serial number + CPUID family/stepping into a stable DWORD.
 // Used to generate a machine-unique driver drop path that avoids a predictable
-// filename IOC like "SIVX64.sys" while remaining stable across reboots.
+// filename IOC like "CorsairLLAccess64.sys" while remaining stable across reboots.
 static DWORD GetHwKey() {
     DWORD serial = 0;
     using GVI_fn = BOOL(WINAPI*)(LPCSTR, LPSTR, DWORD, LPDWORD, LPDWORD, LPDWORD, LPSTR, DWORD);
@@ -36,8 +36,8 @@ static DWORD GetHwKey() {
 
 // ── Driver drop path ──────────────────────────────────────────────────────────
 // Generates a machine-stable path like %SystemRoot%\System32\drivers\A3F19C2B.sys.
-// Copy SIVX64.sys (SIV v5.85, Ray Hinchliffe, WHCP-signed) to this path before
-// launching.
+// Copy CorsairLLAccess64.sys (Corsair Memory, WHCP-signed, SHA256 01E024D3…)
+// to this path before launching.
 static const char* GetDriverPath() {
     static char s_path[MAX_PATH] = {};
     static bool s_ready = false;
@@ -97,24 +97,46 @@ static HANDLE TryOpenDevice(const char* path, DWORD access, DWORD* outErr) {
     return h;
 }
 
-// Case-B recovery: the DACL on \Device\SIVDRIVER may block GENERIC_READ|WRITE
-// even from an admin process. Fall through several access modes and path
-// spellings until one opens, then close it — we only need to prove the
-// device is reachable. Returns the last err code on total failure.
+// Compute the user-mode device path for this run. Corsair's driver builds
+// \Device\<ServiceName> at DriverEntry from its own DriverObject.DriverName,
+// so the device path equals "\\.\<SvcName>" where <SvcName> is what SCM
+// registered us under. Machine-stable — same on every launch on this box.
+static const char* GetDevicePathUserMode() {
+    static char s_path[64] = {};
+    static bool s_ready = false;
+    if (!s_ready) {
+        snprintf(s_path, sizeof(s_path), "\\\\.\\%s", GetSvcName());
+        s_ready = true;
+    }
+    return s_path;
+}
+static const char* GetDevicePathGlobal() {
+    static char s_path[128] = {};
+    static bool s_ready = false;
+    if (!s_ready) {
+        snprintf(s_path, sizeof(s_path), "\\\\.\\GLOBALROOT\\Device\\%s", GetSvcName());
+        s_ready = true;
+    }
+    return s_path;
+}
+
+// Recovery probe: try several access modes + path spellings against the
+// device Corsair publishes for our service name. First success wins.
 static bool ProbeDeviceAllVariants(DWORD* outErr) {
     auto pCloseHandle = RESOLVE(CloseHandle);
     if (!pCloseHandle) { if (outErr) *outErr = 0; return false; }
 
+    const char* pathA = GetDevicePathUserMode();
+    const char* pathB = GetDevicePathGlobal();
+
     struct Attempt { const char* path; DWORD access; };
-    // Ordered from strictest to loosest; first success wins.
     Attempt attempts[] = {
-        { skCrypt("\\\\.\\SIVDRIVER"),        GENERIC_READ | GENERIC_WRITE },
-        { skCrypt("\\\\.\\SIVDRIVER"),        GENERIC_READ                 },
-        { skCrypt("\\\\.\\SIVDRIVER"),        SYNCHRONIZE                  },
-        { skCrypt("\\\\.\\SIVDRIVER"),        0                            },
-        { skCrypt("\\\\.\\GLOBALROOT\\Device\\SIVDRIVER"), GENERIC_READ | GENERIC_WRITE },
-        { skCrypt("\\\\.\\GLOBALROOT\\Device\\SIVDRIVER"), 0               },
-        { skCrypt("\\\\?\\SIVDRIVER"),        GENERIC_READ | GENERIC_WRITE },
+        { pathA, GENERIC_READ | GENERIC_WRITE },
+        { pathA, GENERIC_READ                 },
+        { pathA, SYNCHRONIZE                  },
+        { pathA, 0                            },
+        { pathB, GENERIC_READ | GENERIC_WRITE },
+        { pathB, 0                            },
     };
     DWORD lastErr = 0;
     for (auto& a : attempts) {
@@ -280,12 +302,9 @@ static const char* SvcStateName(DWORD s) {
     }
 }
 
-// SIV's DriverEntry creates \Device\SIVDRIVER unconditionally — it does NOT
-// read Parameters subkey values (unlike WDTKernel, which reads Enabled/
-// Interval/Reboot/AutoRefreshCycle/MinInterval/SSID during DriverEntry and
-// aborts device creation if they're missing). No Parameters key writes are
-// needed here; the service registration under HKLM\SYSTEM\...\Services\<svc>
-// alone is sufficient to let SCM load and start the driver.
+// Corsair's DriverEntry creates \Device\<ServiceName> unconditionally and
+// reads no Parameters subkey values. The plain SCM registration under
+// HKLM\SYSTEM\...\Services\<svc> is enough for SCM to load it.
 
 // Fast sanity check: the file at drvPath must exist, start with MZ,
 // and be a plausible driver size. Catches a mis-copied file before
@@ -364,58 +383,49 @@ static bool StartDriver() {
         return false;
     }
 
-    // (SIVX64.sys reads no Parameters values at DriverEntry — device
-    // creation is unconditional, so no pre-start registry population needed.)
+    // (CorsairLLAccess64.sys reads no Parameters values at DriverEntry —
+    // device creation is unconditional, so no pre-start registry writes needed.)
 
     // Reuse existing service entry after reboot — avoids Event ID 7045 on every launch.
     SC_HANDLE hExist = pOpenServiceA(hSCM, svcName, SERVICE_ALL_ACCESS);
     if (hExist) {
+        // Self-healing lifecycle: if the service already exists (from a
+        // previous run, crashed session, or another user of Corsair's
+        // driver), stop → delete → recreate. This guarantees the device
+        // object was published fresh under our expected name, and no stale
+        // driver-state carries into this session.
         SERVICE_STATUS ss{};
-        bool reused = false;
-
         if (pQueryServiceStatus && pQueryServiceStatus(hExist, &ss)) {
-            for (int i = 0; i < 15 && ss.dwCurrentState == SERVICE_STOP_PENDING; i++) {
+            for (int i = 0; i < 25 && (ss.dwCurrentState == SERVICE_STOP_PENDING ||
+                                        ss.dwCurrentState == SERVICE_START_PENDING); i++) {
                 Sleep(200);
                 pQueryServiceStatus(hExist, &ss);
             }
-            if (ss.dwCurrentState == SERVICE_STOPPED) {
-                BOOL ok2  = pStartServiceA(hExist, 0, nullptr);
-                DWORD e2  = pGetLastError();
-                reused    = ok2 || e2 == ERROR_SERVICE_ALREADY_RUNNING;
-            } else if (ss.dwCurrentState == SERVICE_RUNNING) {
-                reused = true;
-            }
         }
 
-        if (reused) {
-            pCloseServiceHandle(hExist);
-            pCloseServiceHandle(hSCM);
-            return true;
-        }
-
-        if (pControlService) {
+        if (pControlService && ss.dwCurrentState != SERVICE_STOPPED) {
             SERVICE_STATUS ss2{};
             pControlService(hExist, SERVICE_CONTROL_STOP, &ss2);
-            for (int i = 0; i < 20; i++) {
+            for (int i = 0; i < 40; i++) {
                 if (!pQueryServiceStatus || !pQueryServiceStatus(hExist, &ss2)) break;
                 if (ss2.dwCurrentState == SERVICE_STOPPED) break;
-                Sleep(150);
+                Sleep(100);
             }
         }
         pDeleteService(hExist);
         pCloseServiceHandle(hExist);
-        Sleep(300);
+        Sleep(300);   // Let SCM release the image file before the fresh create.
     }
 
     if (GetFileAttributesA(drvPath) == INVALID_FILE_ATTRIBUTES) {
         std::cout << "[!] Driver file not found at: " << drvPath << "\n";
-        std::cout << "    Copy SIVX64.sys to that path and retry.\n";
+        std::cout << "    Copy CorsairLLAccess64.sys to that path and retry.\n";
         pCloseServiceHandle(hSCM);
         return false;
     }
     if (!ValidateDriverFile(drvPath)) {
         std::cout << "[!] Driver file at " << drvPath << " is not a valid PE image.\n";
-        std::cout << "    Re-copy SIVX64.sys to that path.\n";
+        std::cout << "    Re-copy CorsairLLAccess64.sys to that path.\n";
         pCloseServiceHandle(hSCM);
         return false;
     }
@@ -444,11 +454,10 @@ static bool StartDriver() {
         if (*hint) std::cout << " — " << hint;
         std::cout << "\n";
         if (err == 577 || err == 1275) {
-            std::cout << "    Driver blocklist rejected SIVX64. This is unexpected —\n"
-                         "    SIVX64.sys (WHCP-signed, SHA256 33903E8F...) is not on\n"
-                         "    Microsoft's HVCI vulnerable-driver list as of Win11 25H2.\n"
+            std::cout << "    Driver blocklist rejected CorsairLLAccess64.\n"
                          "    Options:\n"
                          "      - Verify the .sys file matches the expected SHA256\n"
+                         "        (01E024D3C76FB1B71851AB7761AFBEE23159D6E8CBF7F5F1D5052EFCA2F7756D)\n"
                          "      - HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Config"
                          " → VulnerableDriverBlocklistEnable = 0, reboot\n"
                          "      - Or use a Windows build/SKU without the blocklist\n";
@@ -502,28 +511,24 @@ static void StopDriver() {
     }
     pCloseServiceHandle(hSCM);
     // Keep the driver file on disk between runs — the machine-stable filename
-    // acts as a persistent one-shot cache. Deleting it forces the user to
-    // re-copy SIVX64.sys before every launch. If you want strict clean-up
+    // acts as a persistent one-shot cache. Deleting it forces a re-copy of
+    // CorsairLLAccess64.sys before every launch. If you want strict clean-up
     // on exit for stealth, uncomment the DeleteFileA call below.
     // DeleteFileA(GetDriverPath());
 }
 
 // Enable admin-available-but-disabled-by-default privileges on the current
-// process token, then VERIFY each one is actually enabled and log the result.
+// process token.
 //
-// SIVX64.sys enforces one specific gate inside IRP_MJ_CREATE (verified
-// against dispatch @ 0x211c8):
-//     SeSinglePrivilegeCheck( SeLoadDriverPrivilege, UserMode ) → must be TRUE
-// otherwise it returns STATUS_ACCESS_DENIED (err=5).
-//
-// A previous silent-best-effort version of this function hid three failure
-// modes: LoadLibraryA of advapi32 not yet done → resolver returns nullptr
-// and the whole thing no-ops; token doesn't hold the privilege → success
-// with ERROR_NOT_ALL_ASSIGNED; another security layer strips it back off
-// after we enable. This version force-loads advapi32, then loops both
-// GetProcAddress-first and lazy-importer-second on the resolver, adjusts,
-// re-queries the token to CONFIRM each privilege is present + enabled,
-// and prints the truth so an err=5 aftermath has ground truth to work from.
+// CorsairLLAccess64's IRP_MJ_CREATE does NOT gate on SeLoadDriverPrivilege
+// (that was SIVX64's gate). It checks the caller's token integrity level and
+// rejects anything below SECURITY_MANDATORY_HIGH_RID (0x3000). Running from
+// an elevated cmd (Admin group + UAC-elevated) satisfies that at High IL by
+// default, so this helper is not strictly required for Corsair — kept here
+// because enabling SeDebug/SeSecurity/etc. is still useful for other paths
+// (process handle open, token dupe, etc.) and costs nothing on the happy
+// path. It also prints ground-truth for the token so a future integrity
+// mismatch has diagnostics to work from.
 static void EnableAdminPrivileges() {
     using PFN_LoadLibraryA         = HMODULE(WINAPI*)(LPCSTR);
     using PFN_GetProcAddress       = FARPROC(WINAPI*)(HMODULE, LPCSTR);
@@ -589,10 +594,8 @@ static void EnableAdminPrivileges() {
         return;
     }
 
-    // The one SIV cares about is at the top of the list — if that fails, the
-    // rest doesn't matter, but we still try them all so unrelated features work.
     static const char* const kPrivs[] = {
-        "SeLoadDriverPrivilege",     // ← THIS is the SIV IRP_MJ_CREATE gate
+        "SeLoadDriverPrivilege",
         "SeDebugPrivilege",
         "SeSecurityPrivilege",
         "SeTakeOwnershipPrivilege",
@@ -614,13 +617,9 @@ static void EnableAdminPrivileges() {
         pAdjustTokenPrivileges(hTok, FALSE, &tp, sizeof(tp), nullptr, nullptr);
     }
 
-    // Re-query the token and print which privileges are actually enabled.
-    // This is the ground-truth pass: if SeLoadDriverPrivilege isn't ENABLED
-    // after our AdjustTokenPrivileges loop, no amount of retry inside our
-    // own code will make SIV's IRP_MJ_CREATE gate pass — the fix is external
-    // (elevate differently, run under SYSTEM, or grant the privilege via
-    // local security policy: secpol.msc → Local Policies → User Rights
-    // Assignment → "Load and unload device drivers" → Add current user).
+    // Re-query the token and print a summary. Corsair does not gate on
+    // SeLoadDriverPrivilege, but we still surface its state — an err=5 on
+    // an unusual host may correlate with an unexpected token shape.
     if (pGetTokenInformation) {
         DWORD needed = 0;
         pGetTokenInformation(hTok, TokenPrivileges, nullptr, 0, &needed);
@@ -642,18 +641,7 @@ static void EnableAdminPrivileges() {
                           << (loadDrvHeld ? (loadDrvEnabled ? "\033[92mENABLED\033[0m"
                                                             : "\033[93mheld but DISABLED\033[0m")
                                           : "\033[91mNOT HELD\033[0m") << "\n";
-                if (!loadDrvHeld) {
-                    std::cout << "  \033[91m[!]\033[0m Your token doesn't hold SeLoadDriverPrivilege.\n"
-                                 "      SIV's IRP_MJ_CREATE gate WILL reject with err=5 no matter what.\n"
-                                 "      Fix: secpol.msc → Local Policies → User Rights Assignment →\n"
-                                 "      'Load and unload device drivers' → add your user, log out/in.\n"
-                                 "      Or: run this exe from an elevated cmd started under the\n"
-                                 "      Administrators group (not standard user + UAC prompt).\n";
-                } else if (!loadDrvEnabled) {
-                    std::cout << "  \033[91m[!]\033[0m Privilege held but our AdjustTokenPrivileges call\n"
-                                 "      didn't stick. Something is stripping it back off. Check for\n"
-                                 "      third-party token filters (some AV / EDR do this).\n";
-                }
+                (void)loadDrvHeld; (void)loadDrvEnabled;
             }
         }
     }
@@ -702,12 +690,16 @@ int main()
 
     AntiDebug::Assert();
 
-    // Enable admin-token privileges BEFORE the driver load. SIVX64.sys
-    // imports SeSinglePrivilegeCheck and enforces it inside IRP_MJ_CREATE,
-    // so device-open (CreateFileA on \\.\SIVDRIVER) returns err=5 for an
-    // admin whose token has SeDebugPrivilege / SeLoadDriverPrivilege held
-    // but not enabled — which is the default on any elevated admin.
+    // Enable admin-token privileges before the driver load. Corsair's
+    // IRP_MJ_CREATE only requires token integrity ≥ High (satisfied by
+    // running elevated), but SeDebug/SeSecurity being enabled early helps
+    // downstream (process token dupe, module walks). Cheap on happy path.
     EnableAdminPrivileges();
+
+    // Tell WinDrvReader the exact device path derived from our service name.
+    // Corsair builds \Device\<ServiceName> at DriverEntry, so once StartDriver
+    // registers us as GetSvcName(), the device is at \\.\<GetSvcName()>.
+    WinDrvReader::Get().SetDevicePath(GetDevicePathUserMode());
 
     // ── Driver loading ────────────────────────────────────────────────────────
     std::cout << "  \033[96m[*]\033[0m Starting driver...\n";
@@ -740,26 +732,22 @@ int main()
                 std::cout << "  \033[91m[!]\033[0m Recovery failed.  service=" << SvcStateName(st2)
                           << "  device err=" << e2 << "\n";
                 if (e2 == 2) {
-                    std::cout << "      → Driver loaded but never published \\Device\\SIVDRIVER.\n"
-                                 "        SIVX64.sys creates its device unconditionally in DriverEntry, so\n"
-                                 "        an err=2 here after a successful service start almost always means\n"
-                                 "        HVCI/CI silently blocked the load, an anti-cheat DSE hook stripped\n"
-                                 "        device creation, or the on-disk file's signature was altered.\n"
-                                 "        Re-verify SHA256 (33903E8F...) and check HVCI blocklist state.\n";
+                    std::cout << "      → Driver loaded but never published its device object.\n"
+                                 "        Corsair's DriverEntry creates \\Device\\<SvcName> unconditionally, so\n"
+                                 "        err=2 here after a successful service start usually means HVCI/CI\n"
+                                 "        silently blocked the load, an AC DSE hook stripped device creation,\n"
+                                 "        or the on-disk file's signature was altered. Re-verify SHA256\n"
+                                 "        (01E024D3...) and check HVCI blocklist state.\n";
                 } else if (e2 == 5) {
-                    std::cout << "      → Device exists but every access mode was rejected (ACCESS_DENIED).\n"
-                                 "        Token privileges have already been enabled before this probe, so\n"
-                                 "        the likely remaining causes are:\n"
-                                 "          1. An anti-cheat (Vanguard/EAC/BE) is running with an ObRegister-\n"
-                                 "             CallbacksEx hook stripping FILE_ALL_ACCESS from non-whitelisted\n"
-                                 "             processes on \\Device\\SIVDRIVER. Close CS2 and any anti-cheat\n"
-                                 "             tray process, verify with `pslist \\\\.\\SIVDRIVER handles`, retry.\n"
-                                 "          2. Windows Defender Attack Surface Reduction rule 'Block abuse of\n"
-                                 "             exploited vulnerable signed drivers' is on. Check via:\n"
-                                 "               Get-MpPreference | Select AttackSurfaceReductionRules_Ids\n"
-                                 "          3. A leftover handle from a previous SIV.exe run is holding the\n"
-                                 "             device exclusive-open. `handle64.exe SIVDRIVER` to find it.\n"
-                                 "          4. Token integrity level < High (elevation somehow degraded).\n";
+                    std::cout << "      → Device exists but IRP_MJ_CREATE was rejected (ACCESS_DENIED).\n"
+                                 "        Corsair enforces token integrity ≥ High on open. Likely causes:\n"
+                                 "          1. Token integrity level < High. Re-launch from an elevated cmd\n"
+                                 "             started under the Administrators group (not SUA + UAC prompt).\n"
+                                 "          2. Anti-cheat ObRegisterCallbacksEx hook stripping FILE_ALL_ACCESS\n"
+                                 "             on our device. Close CS2 + any AC tray processes and retry.\n"
+                                 "          3. Windows Defender ASR rule 'Block abuse of exploited vulnerable\n"
+                                 "             signed drivers'. Check: Get-MpPreference |\n"
+                                 "             Select AttackSurfaceReductionRules_Ids\n";
                 }
             }
         }
@@ -801,7 +789,7 @@ int main()
                 DWORD state = QueryServiceState(GetSvcName());
                 std::cout << "\n\n  \033[91m[!]\033[0m Driver did not load.\n";
                 std::cout << "      Service:        " << GetSvcName() << " (state=" << SvcStateName(state) << ")\n";
-                std::cout << "      Device probe:   \\\\.\\SIVDRIVER  err=" << lastDrvErr;
+                std::cout << "      Device probe:   " << GetDevicePathUserMode() << "  err=" << lastDrvErr;
                 switch (lastDrvErr) {
                     case 2:   std::cout << " (ERROR_FILE_NOT_FOUND — driver loaded but never published its device object;\n"
                                           "                            typically means it's PnP-oriented and needs matching hardware,\n"
