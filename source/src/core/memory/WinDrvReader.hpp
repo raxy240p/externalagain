@@ -1162,9 +1162,31 @@ private:
             if (ok != FALSE && returned == (DWORD)bytes) cls = SivFail::Ok;
         }
 
+        // HandleStale (err=6) means the driver was reloaded out from under
+        // us (MSI Center restarting its service, an admin poking
+        // sc.exe stop/start, or our own self-heal after a Vanguard bump).
+        // Two side-effects that need clearing so the NEXT read recovers:
+        //   1. Close the handle so the idle-mode reopen builds a fresh one.
+        //   2. Clear m_armed — the driver's activation global was zeroed on
+        //      unload, so the reopen must re-ARM. Without this, m_armed
+        //      stays true, NtioArm short-circuits, and every subsequent
+        //      read fails permanently until the user restarts the cheat.
+        if (cls == SivFail::HandleStale) {
+            EnterCriticalSection(&m_physLock);
+            if (m_hDevice != INVALID_HANDLE_VALUE) {
+                CloseHandle(m_hDevice);
+                m_hDevice = INVALID_HANDLE_VALUE;
+            }
+            LeaveCriticalSection(&m_physLock);
+            m_armed.store(false, std::memory_order_release);
+            ownedOpen = false;   // handle already gone
+        }
+
         if (ownedOpen) {
             EnterCriticalSection(&m_physLock);
-            CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE;
+            if (m_hDevice != INVALID_HANDLE_VALUE) {
+                CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE;
+            }
             LeaveCriticalSection(&m_physLock);
         }
 
