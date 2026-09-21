@@ -7,7 +7,88 @@
 #include <chrono>
 #include <cmath>
 #include <vector>
+#include <Windows.h>   // SendInput, GetAsyncKeyState, INPUT, VK_* for triggerbot
 #include "gui/renderer/Renderer.hpp"
+
+// ── Triggerbot ─────────────────────────────────────────────────────────────
+// SendInput MOUSE_LEFTDOWN+LEFTUP pulse when the crosshair overlaps a bone
+// in the selected zone on an alive enemy. Runs from Esp::RenderImpl inside
+// the per-player loop, which already has the fresh view matrix + bones in
+// scope — zero extra work on the read-side. The bound key is polled via
+// GetAsyncKeyState (works for keyboard + mouse VK codes). Cooldown is
+// enforced at the class level so we don't fire N times per frame when a
+// body camps the crosshair.
+namespace trig {
+	static std::chrono::steady_clock::time_point s_lastShot{};
+
+	// ImGuiKey → Win32 VK. Keyboard rows are dense in ImGui's enum; letter
+	// keys and digits map linearly. Mouse buttons and the special row use
+	// hand-mapped constants. Anything unknown returns 0 = no fire.
+	static int ImKeyToVK(int k) {
+		if (k >= ImGuiKey_A && k <= ImGuiKey_Z)         return 'A' + (k - ImGuiKey_A);
+		if (k >= ImGuiKey_0 && k <= ImGuiKey_9)         return '0' + (k - ImGuiKey_0);
+		if (k >= ImGuiKey_F1 && k <= ImGuiKey_F12)      return VK_F1 + (k - ImGuiKey_F1);
+		switch (k) {
+			case ImGuiKey_MouseLeft:    return VK_LBUTTON;
+			case ImGuiKey_MouseRight:   return VK_RBUTTON;
+			case ImGuiKey_MouseMiddle:  return VK_MBUTTON;
+			case ImGuiKey_MouseX1:      return VK_XBUTTON1;
+			case ImGuiKey_MouseX2:      return VK_XBUTTON2;
+			case ImGuiKey_Space:        return VK_SPACE;
+			case ImGuiKey_LeftShift:    return VK_LSHIFT;
+			case ImGuiKey_RightShift:   return VK_RSHIFT;
+			case ImGuiKey_LeftCtrl:     return VK_LCONTROL;
+			case ImGuiKey_RightCtrl:    return VK_RCONTROL;
+			case ImGuiKey_LeftAlt:      return VK_LMENU;
+			case ImGuiKey_RightAlt:     return VK_RMENU;
+			case ImGuiKey_CapsLock:     return VK_CAPITAL;
+			case ImGuiKey_Tab:          return VK_TAB;
+			case ImGuiKey_Insert:       return VK_INSERT;
+			case ImGuiKey_Home:         return VK_HOME;
+			case ImGuiKey_End:          return VK_END;
+			default:                    return 0;
+		}
+	}
+
+	// Bones per zone. Any bone with zero pos is skipped by BoneValid.
+	static const int kHeadBones[]  = { bone_index::head };
+	static const int kBodyBones[]  = { bone_index::neck, bone_index::chest,
+	                                    bone_index::spine_2, bone_index::spine_1,
+	                                    bone_index::pelvis };
+	static const int kLegBones[]   = { bone_index::hip_L,  bone_index::knee_L,
+	                                    bone_index::foot_heel_L,
+	                                    bone_index::hip_R,  bone_index::knee_R,
+	                                    bone_index::foot_heel_R };
+	static const int kAllBones[]   = { bone_index::head, bone_index::neck,
+	                                    bone_index::chest, bone_index::spine_2,
+	                                    bone_index::spine_1, bone_index::pelvis,
+	                                    bone_index::hip_L, bone_index::knee_L,
+	                                    bone_index::foot_heel_L,
+	                                    bone_index::hip_R, bone_index::knee_R,
+	                                    bone_index::foot_heel_R };
+
+	static void ZoneBones(int zone, const int*& out, int& n) {
+		switch (zone) {
+			case 0: out = kHeadBones; n = (int)std::size(kHeadBones); return;
+			case 1: out = kBodyBones; n = (int)std::size(kBodyBones); return;
+			case 2: out = kLegBones;  n = (int)std::size(kLegBones);  return;
+			default: out = kAllBones; n = (int)std::size(kAllBones);  return;
+		}
+	}
+
+	// Single MOUSE1 pulse via SendInput. Uses INPUT_MOUSE with LEFTDOWN then
+	// LEFTUP in one array so the two events go through the input stack
+	// back-to-back, minimizing the window where a game frame could see only
+	// half of the click.
+	static void FireOnce() {
+		INPUT in[2] = {};
+		in[0].type = INPUT_MOUSE;
+		in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+		in[1].type = INPUT_MOUSE;
+		in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+		SendInput(2, in, sizeof(INPUT));
+	}
+}
 
 bool Esp::Init()   { return GetInstance().InitImpl();   }
 void Esp::Render() { return GetInstance().RenderImpl(); }
@@ -80,6 +161,32 @@ void Esp::RenderImpl() {
 	if (predDt < 0.f)  predDt = 0.f;
 	if (predDt > 0.02f) predDt = 0.02f;
 
+	// Triggerbot precondition — computed once per frame so the per-player loop
+	// stays branch-light. We fire only when: cfg is on, the bound key is held
+	// physically (GetAsyncKeyState — works whether the game has focus or
+	// ImGui is drawing), the mouse isn't captured by an ImGui widget (so the
+	// user can hold the trigger key while browsing the menu without spraying),
+	// local player is alive, and — if ignore_flashed is on — we aren't blinded.
+	const bool triggerActive = [&]() -> bool {
+		if (!cfg::esp::trigger::enabled) return false;
+		if (this->io.WantCaptureMouse)   return false;
+		if (!local.localplayer)          return false;  // local snapshot not populated yet
+		if (!local.alive)                return false;
+		int vk = trig::ImKeyToVK(cfg::esp::trigger::key);
+		if (!vk)                          return false;
+		if (!(GetAsyncKeyState(vk) & 0x8000)) return false;
+		if (cfg::esp::trigger::ignore_flashed && local.flashed) return false;
+		return true;
+	}();
+
+	// Cache screen center + zone bone table so the loop just reads
+	const float scrCx = io.DisplaySize.x * 0.5f;
+	const float scrCy = io.DisplaySize.y * 0.5f;
+	const int*  zoneBones = nullptr;
+	int         zoneN     = 0;
+	if (triggerActive) trig::ZoneBones(cfg::esp::trigger::zone, zoneBones, zoneN);
+	const float hitR2 = cfg::esp::trigger::hit_radius_px * cfg::esp::trigger::hit_radius_px;
+
 	{
 		static int s_espFrame = 0;
 		if (++s_espFrame % 300 == 1) {
@@ -124,6 +231,32 @@ void Esp::RenderImpl() {
 
 		if (local.index >= 0 && local.index < 64)
 			pred.spotted = (raw.spotted_by_mask >> local.index) & 1u;
+
+		// Triggerbot check — only for alive enemies (mate already excluded above
+		// via team check in the block below is misleading; we re-verify here so
+		// team-visible enemies with ESP-team-off still qualify). Uses predicted
+		// bones so fast-strafing targets don't slip the hit test.
+		if (triggerActive && !mate && pred.alive) {
+			auto sinceLast = std::chrono::duration_cast<std::chrono::milliseconds>(
+				now - trig::s_lastShot).count();
+			if (sinceLast >= (long long)cfg::esp::trigger::delay_ms) {
+				for (int bi = 0; bi < zoneN; ++bi) {
+					int idx = zoneBones[bi];
+					if (idx < 0 || idx >= (int)pred.bone_list.size()) continue;
+					const Vec3_t& bp = pred.bone_list[idx].pos;
+					if (!BoneValid(bp)) continue;
+					Vec2_t sp;
+					if (!matrix.wts(bp, io.DisplaySize, sp)) continue;
+					float dx = sp.x - scrCx;
+					float dy = sp.y - scrCy;
+					if (dx*dx + dy*dy <= hitR2) {
+						trig::FireOnce();
+						trig::s_lastShot = now;
+						break;
+					}
+				}
+			}
+		}
 
 		RenderPlayerTracers(local, pred, mate);
 		RenderPlayer(pred, mate);
