@@ -265,12 +265,20 @@ public:
     // Idle mode: close the device handle when not reading, reopen per-IOCTL.
     // An open \\.\ handle is visible in the calling process's handle table;
     // closing it between scans removes that detection surface.
+    //
+    // Race safety: acquire m_physLock across the whole transition so a
+    // concurrent NtioReadOnce mid-flight either (a) captured hUse under the
+    // lock BEFORE we close and still holds a valid handle for DeviceIoControl,
+    // or (b) captures hUse AFTER our close-and-null and takes the reopen
+    // path. No window where a caller uses a dangling handle.
     void SetIdleMode(bool enable) {
+        EnterCriticalSection(&m_physLock);
         m_idleMode = enable;
         if (enable && IsOpen()) {
             CloseHandle(m_hDevice);
             m_hDevice = INVALID_HANDLE_VALUE;
         }
+        LeaveCriticalSection(&m_physLock);
     }
 
     void Close() {
@@ -1091,8 +1099,8 @@ private:
 
         HANDLE hUse = INVALID_HANDLE_VALUE;
         bool   ownedOpen = false;
+        EnterCriticalSection(&m_physLock);
         if (m_idleMode) {
-            EnterCriticalSection(&m_physLock);
             if (!IsOpen()) {
                 m_hDevice = CreateFileA(GetDevicePath(),
                                         GENERIC_READ | GENERIC_WRITE,
@@ -1100,23 +1108,20 @@ private:
                                         nullptr, OPEN_EXISTING,
                                         FILE_ATTRIBUTE_NORMAL, nullptr);
                 if (m_hDevice != INVALID_HANDLE_VALUE) {
-                    // Fresh handle → re-arm before first IOCTL. Armed state
-                    // lives in the driver's global, not the handle, so this
-                    // is a no-op if we're merely reopening a device that
-                    // was already armed by an earlier session; but the
-                    // magic-write is cheap and idempotent.
+                    // Fresh handle in idle mode. NtioArm short-circuits via
+                    // m_armed after the first successful Open()-time ARM in
+                    // this driver session, so this is a load+branch (no
+                    // syscall) on every idle reopen from cache read #1 on.
                     NtioArm(m_hDevice);
                 }
                 ownedOpen = (m_hDevice != INVALID_HANDLE_VALUE);
             }
-            hUse = m_hDevice;
-            LeaveCriticalSection(&m_physLock);
-            if (hUse == INVALID_HANDLE_VALUE) {
-                NoteSivFail(SivFail::HandleFailed, physAddr, (DWORD)bytes, 0, GetLastError());
-                return false;
-            }
-        } else {
-            hUse = m_hDevice;
+        }
+        hUse = m_hDevice;
+        LeaveCriticalSection(&m_physLock);
+        if (hUse == INVALID_HANDLE_VALUE) {
+            NoteSivFail(SivFail::HandleFailed, physAddr, (DWORD)bytes, 0, GetLastError());
+            return false;
         }
 
         NtioReadReq req{};
@@ -1593,13 +1598,16 @@ private:
         return s;
     }
 
-    // 128 × 4KB = 512 KB of cached physical pages. WDTKernel needed 512 slots
-    // because a cold page fill cost 512+ IOCTLs — thrash on eviction was
-    // catastrophic. SIV fills a page in ONE IOCTL, so the driver-side
-    // mapping cache and this LRU together already dominate the WDT-era 512
-    // configuration; 128 fits comfortably in a Zen3 L2 (5700x has 512 KB
-    // per core) with room to spare and cuts steady-state RAM by 1.5 MB.
-    static constexpr int kPhysPageCacheN = 128;
+    // 256 × 4 KB = 1 MB of cached physical pages. Sized for the 5700x /
+    // 32 GB target: the Zen3 shared L3 is 32 MB, so 1 MB is comfortable
+    // headroom. NTIOLib fills a page in a single IOCTL (was 1024 under
+    // Corsair), and every avoided cold-miss saves one kernel round-trip
+    // on the cache-thread hot path. Doubling the cache from the Corsair
+    // era's 128 slots captures more of the entity working set on rounds
+    // where the player count is high (up to 10 controllers × ~5 hot pages
+    // each + a dozen weapon/globals pages) with room for VM/EPROCESS
+    // page reuse. Steady-state cost: +512 KB heap.
+    static constexpr int kPhysPageCacheN = 256;
     struct PhysPageEntry { uint64_t pa; uint8_t data[4096]; };
 
     bool            m_idleMode         = false;
