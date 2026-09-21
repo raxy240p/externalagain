@@ -162,13 +162,18 @@ void Esp::RenderImpl() {
 	if (predDt > 0.02f) predDt = 0.02f;
 
 	// Triggerbot precondition — computed once per frame so the per-player loop
-	// stays branch-light. We fire only when: cfg is on, the bound key is held
-	// physically (GetAsyncKeyState — works whether the game has focus or
-	// ImGui is drawing), the mouse isn't captured by an ImGui widget (so the
-	// user can hold the trigger key while browsing the menu without spraying),
-	// local player is alive, and — if ignore_flashed is on — we aren't blinded.
+	// stays branch-light. All gates must pass:
+	//   • cfg on
+	//   • menu NOT open (so a held key never sprays while adjusting settings)
+	//   • CS2 IS the foreground window (never fire into another app on alt-tab)
+	//   • ImGui isn't capturing the mouse (menu closed but a stray tooltip up)
+	//   • local snapshot exists and local is alive
+	//   • bound key is currently held (GetAsyncKeyState — polls the OS input
+	//     state directly, works whether CS2 or the overlay has focus)
+	//   • not blinded, when Ignore Flashed is on
 	const bool triggerActive = [&]() -> bool {
 		if (!cfg::esp::trigger::enabled) return false;
+		if (Renderer::IsOpen())          return false;  // menu open -> never fire
 		if (this->io.WantCaptureMouse)   return false;
 		if (!local.localplayer)          return false;  // local snapshot not populated yet
 		if (!local.alive)                return false;
@@ -176,6 +181,11 @@ void Esp::RenderImpl() {
 		if (!vk)                          return false;
 		if (!(GetAsyncKeyState(vk) & 0x8000)) return false;
 		if (cfg::esp::trigger::ignore_flashed && local.flashed) return false;
+		// CS2 must own the foreground; if the process handle isn't up yet or
+		// the hwnd hasn't been resolved, err on the safe side and don't fire.
+		auto proc = Engine::GetProcess();
+		if (!proc || !proc->hwnd_) return false;
+		if (GetForegroundWindow() != proc->hwnd_) return false;
 		return true;
 	}();
 
