@@ -12,13 +12,11 @@
 #include <numeric>
 #include <cstdarg>
 
-static void FLog(const char* fmt, ...) {
-    static FILE* f = nullptr;
-    if (!f) f = fopen("esp_debug.txt", "a");
-    if (!f) return;
-    va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a);
-    fflush(f);
-}
+// FLog was a diagnostic writer to "esp_debug.txt" next to the exe.
+// Both the filename string and the "esp_debug" identifier are trivial
+// IOCs for static scanners. Neutered to an inline no-op — the compiler
+// drops the call sites entirely so no diagnostic strings leak.
+static inline void FLog(const char*, ...) {}
 
 bool Cache::Refresh() {
     return Get().RefreshImpl();

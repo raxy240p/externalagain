@@ -6,13 +6,12 @@ using steady_clock = std::chrono::steady_clock;
 #include <cstdio>
 #include <cstdarg>
 
-static void FLog(const char* fmt, ...) {
-    static FILE* f = nullptr;
-    if (!f) f = fopen("C:\\Users\\olive\\Desktop\\esp_debug.txt", "w");
-    if (!f) return;
-    va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a);
-    fflush(f);
-}
+// FLog was a per-frame diagnostic writer to a hardcoded desktop path.
+// Both the path string ("C:\\Users\\...\\esp_debug.txt") and the "FLog"
+// call sites are trivial IOCs for static signature scanners. Neutered
+// to an empty inline no-op so the compiler drops the calls entirely
+// and no diagnostic strings leak into the binary.
+static inline void FLog(const char*, ...) {}
 #include "Weapon.hpp"
 #include "core/engine/Engine.hpp"
 #include "core/engine/DebugEsp.hpp"

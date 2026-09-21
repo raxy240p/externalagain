@@ -35,6 +35,23 @@ namespace cfg {
 			inline bool scoped = false;
 		}
 
+		// Triggerbot: fires MOUSE1 (SendInput INPUT_MOUSE, LEFTDOWN+LEFTUP)
+		// when the crosshair (screen center) is within hit_radius_px of any
+		// bone in the selected zone on an alive enemy. Only active while
+		// the bound key is held. delay_ms is the minimum interval between
+		// consecutive shots on the SAME target — protects against fully-
+		// auto weapon walk-on and prevents infinite fire when the crosshair
+		// parks on a body.
+		namespace trigger {
+			inline bool  enabled       = false;
+			inline int   key           = ImGuiKey_MouseX1;   // side-mouse button by default
+			inline int   zone          = 0;                  // 0 = head, 1 = body, 2 = legs, 3 = any
+			inline float hit_radius_px = 4.0f;               // 1..24 px around screen center
+			inline int   delay_ms      = 90;                 // 20..500 ms between shots
+			inline bool  ignore_flashed = true;              // don't fire while we're blinded
+			inline bool  ignore_smoked  = false;             // reserved (post-processing needed)
+		}
+
 	namespace colors {
 			inline color_t box_team{ 0.f, 1.f, 0.29f, 0.5f };
 			inline color_t box_enemy{ 1.f, 0.f, 0.f, 0.5f };

@@ -125,6 +125,12 @@ static const CfgEntry kCfgEntries[]{
     {"set.free_cpu",      'b', &cfg::settings::free_cpu},
     {"bind.menu_key",     'i', &cfg::settings::menu_key},
     {"theme.accent",      'a', &g_accentF},
+    {"trig.enabled",      'b', &cfg::esp::trigger::enabled},
+    {"trig.key",          'i', &cfg::esp::trigger::key},
+    {"trig.zone",         'i', &cfg::esp::trigger::zone},
+    {"trig.hit_radius",   'f', &cfg::esp::trigger::hit_radius_px},
+    {"trig.delay_ms",     'i', &cfg::esp::trigger::delay_ms},
+    {"trig.ign_flashed",  'b', &cfg::esp::trigger::ignore_flashed},
 };
 
 static char   s_cfgMsg[32] = "";
@@ -375,6 +381,86 @@ static bool ZukSlider(const char* label, float* v, float vmin, float vmax, const
     return changed;
 }
 
+// ── ZukSelect: horizontal pill strip radio (label + N options) ────────────────
+static bool ZukSelect(const char* label, int* v, const char* const* opts, int n)
+{
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2      p  = ImGui::GetCursorScreenPos();
+    const float w  = ImGui::GetContentRegionAvail().x;
+    constexpr float h = 36.f;
+
+    float st    = Stagger();
+    float aSave = g_alpha;
+    g_alpha     = ImMin(g_alpha, st);
+    ImVec2 pd(p.x, p.y + (1.f - st) * 6.f);
+
+    ImGuiID id  = ImGui::GetID(label);
+    bool    hov = ImGui::IsWindowHovered() &&
+                  ImGui::IsMouseHoveringRect(p, {p.x + w, p.y + h});
+    float   ha  = Anim(id, hov, 16.f);
+
+    if (ha > 0.01f) {
+        dl->AddRectFilled(pd, {pd.x + w, pd.y + h}, A(IM_COL32(255,255,255,5), ha), 8.f);
+        dl->AddRectFilled(pd, {pd.x + w, pd.y + h}, A(Accent(7), ha), 8.f);
+    }
+
+    ImGui::PushFont(g_fontUiMd);
+    float lh = ImGui::GetTextLineHeight();
+    dl->AddText({pd.x + 10.f, pd.y + (h - lh) * 0.5f},
+                A(LerpCol(kTxtLo, kTxtHi, ImMax(0.5f, ha * 0.35f))), label);
+    ImGui::PopFont();
+
+    // Strip on the right — each pill sized to fit its label
+    if (n > 8) n = 8;
+    ImGui::PushFont(g_fontMono9);
+    constexpr float chH = 20.f, chGap = 4.f, chPadX = 8.f;
+    float total = 0.f;
+    for (int i = 0; i < n; i++) {
+        ImVec2 ts = ImGui::CalcTextSize(opts[i]);
+        total += ts.x + chPadX * 2.f + (i > 0 ? chGap : 0.f);
+    }
+    float sx = pd.x + w - 10.f - total;
+    float sy = pd.y + (h - chH) * 0.5f;
+
+    bool changed = false;
+    int  hovIdx  = -1;
+    float cx = sx;
+    struct Rect { float x0, y0, x1, y1; };
+    Rect rects[8];
+    for (int i = 0; i < n; i++) {
+        ImVec2 ts = ImGui::CalcTextSize(opts[i]);
+        float cw = ts.x + chPadX * 2.f;
+        rects[i] = { cx, sy, cx + cw, sy + chH };
+        cx += cw + chGap;
+    }
+    for (int i = 0; i < n; i++) {
+        bool sh = ImGui::IsWindowHovered() &&
+                  ImGui::IsMouseHoveringRect({rects[i].x0, rects[i].y0}, {rects[i].x1, rects[i].y1});
+        if (sh) hovIdx = i;
+        bool sel = (*v == i);
+        ImU32 fill = sel ? Accent(int(60))
+                         : IM_COL32(255, 255, 255, sh ? 20 : 9);
+        ImU32 ring = sel ? Accent(int(220))
+                         : IM_COL32(255, 255, 255, sh ? 90 : 30);
+        ImU32 tc   = sel ? Accent(255)
+                         : IM_COL32(255, 255, 255, sh ? 210 : 150);
+        dl->AddRectFilled({rects[i].x0, rects[i].y0}, {rects[i].x1, rects[i].y1}, A(fill), 5.f);
+        dl->AddRect      ({rects[i].x0, rects[i].y0}, {rects[i].x1, rects[i].y1}, A(ring), 5.f, 0, 1.f);
+        ImVec2 ts = ImGui::CalcTextSize(opts[i]);
+        dl->AddText({rects[i].x0 + chPadX, rects[i].y0 + (chH - ts.y) * 0.5f}, A(tc), opts[i]);
+    }
+    ImGui::PopFont();
+
+    ImGui::InvisibleButton(label, {w, h});
+    if (ImGui::IsItemClicked() && hovIdx >= 0 && *v != hovIdx) {
+        *v = hovIdx;
+        changed = true;
+    }
+
+    g_alpha = aSave;
+    return changed;
+}
+
 // ── EspPreviewCanvas: live mock player driven by cfg ─────────────────────────
 static void EspPreviewCanvas(float height)
 {
@@ -578,7 +664,11 @@ static void KeybindRow(const char* label, int* key)
 
     if (listening) {
         for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
-            if (k >= ImGuiKey_MouseLeft && k <= ImGuiKey_MouseWheelY) continue;
+            // Skip: LMB (used to enter listen mode, would insta-bind) and
+            // wheel deltas (not holdable). Allow RMB/MMB/X1/X2 so the
+            // trigger key can be bound to a mouse side button.
+            if (k == ImGuiKey_MouseLeft ||
+                k == ImGuiKey_MouseWheelX || k == ImGuiKey_MouseWheelY) continue;
             if (!ImGui::IsKeyPressed((ImGuiKey)k, false)) continue;
             if (k != ImGuiKey_Escape) *key = k;
             s_listening = 0;
@@ -965,7 +1055,8 @@ void Menu::RenderImpl()
         cfg::esp::armor    + cfg::esp::team      +
         cfg::esp::flags::name    + cfg::esp::flags::weapon + cfg::esp::flags::ammo +
         cfg::esp::flags::reloading + cfg::esp::flags::defusing + cfg::esp::flags::money +
-        cfg::esp::flags::flashed + cfg::esp::flags::scoped  + cfg::esp::flags::ping,
+        cfg::esp::flags::flashed + cfg::esp::flags::scoped  + cfg::esp::flags::ping +
+        int(cfg::esp::trigger::enabled),
         cfg::world::spectators::enabled +
         (cfg::world::spectators::enabled
             ? int(cfg::world::spectators::detailed) + cfg::world::spectators::self_only
@@ -1058,11 +1149,14 @@ void Menu::RenderImpl()
         ZukToggle(skCrypt("Health Number"), &cfg::esp::health_number);
         ZukToggle(skCrypt("Armor Bar"),     &cfg::esp::armor);
         ZukToggle(skCrypt("Show Team"),     &cfg::esp::team);
+        ZukToggle(skCrypt("Only Spotted"),  &cfg::esp::spotted);
+        ZukToggle(skCrypt("Spotted Color"), &cfg::esp::spotted_color,
+                  &cfg::esp::colors::box_spotted);
         ImGui::EndChild();
 
         ImGui::SetCursorPos({kSideW + kCol3, kTopH + slide});
         ImGui::BeginChild("##flags", {kCol3, kPanH - slide},
-                          ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
+                          ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_None);
         g_stagger = 0;
         Section(skCrypt("FLAGS"));
         ZukToggle(skCrypt("Name"),     &cfg::esp::flags::name);
@@ -1074,6 +1168,28 @@ void Menu::RenderImpl()
         ZukToggle(skCrypt("Flashed"),  &cfg::esp::flags::flashed);
         ZukToggle(skCrypt("Scoped"),   &cfg::esp::flags::scoped);
         ZukToggle(skCrypt("Ping"),     &cfg::esp::flags::ping);
+
+        ImGui::Dummy({0.f, 8.f});
+        Section(skCrypt("TRIGGER"));
+        ZukToggle(skCrypt("Enabled"),  &cfg::esp::trigger::enabled);
+        KeybindRow(skCrypt("Key"),     &cfg::esp::trigger::key);
+        {
+            auto _zH = skCrypt("HEAD"), _zB = skCrypt("BODY"),
+                 _zL = skCrypt("LEGS"), _zA = skCrypt("ANY");
+            const char* zopts[]{(const char*)_zH, (const char*)_zB,
+                                (const char*)_zL, (const char*)_zA};
+            ZukSelect(skCrypt("Zone"), &cfg::esp::trigger::zone, zopts, 4);
+        }
+        ZukSlider(skCrypt("Hit Radius"), &cfg::esp::trigger::hit_radius_px,
+                  1.f, 24.f, skCrypt("%.1fPX"));
+        {
+            // int → float wrapper so ZukSlider (float*) can drive delay_ms
+            static float _delayF = (float)cfg::esp::trigger::delay_ms;
+            _delayF = (float)cfg::esp::trigger::delay_ms;
+            if (ZukSlider(skCrypt("Delay"), &_delayF, 20.f, 500.f, skCrypt("%.0fMS")))
+                cfg::esp::trigger::delay_ms = (int)_delayF;
+        }
+        ZukToggle(skCrypt("Ignore Flashed"), &cfg::esp::trigger::ignore_flashed);
         ImGui::EndChild();
 
         ImGui::SetCursorPos({kSideW + kCol3 * 2.f, kTopH + slide});
@@ -1113,6 +1229,17 @@ void Menu::RenderImpl()
         Section(skCrypt("OVERLAY"));
         ZukToggle(skCrypt("Crosshair"),      &cfg::world::crosshair::enabled);
         ZukToggle(skCrypt("Velocity Graph"), &cfg::world::velocity::enabled);
+        if (cfg::world::velocity::enabled) {
+            ImGui::Indent(12.f);
+            static float _velRate  = (float)cfg::world::velocity::sample_rate;
+            static float _velLen   =        cfg::world::velocity::sample_length;
+            _velRate = (float)cfg::world::velocity::sample_rate;
+            if (ZukSlider(skCrypt("Sample Rate"),   &_velRate, 5.f, 120.f, skCrypt("%.0fHZ")))
+                cfg::world::velocity::sample_rate = (int)_velRate;
+            if (ZukSlider(skCrypt("Sample Length"), &_velLen,  1.f,  10.f, skCrypt("%.1fS")))
+                cfg::world::velocity::sample_length = _velLen;
+            ImGui::Unindent(12.f);
+        }
         ImGui::EndChild();
     }
     else {
