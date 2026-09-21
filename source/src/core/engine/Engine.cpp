@@ -36,15 +36,17 @@ bool Engine::InitImpl() {
     auto& drv = WinDrvReader::Get();
 
     printf(skCrypt("[SysMonitor] starting...\n"));
+
+    // Reset breaker/armed state FIRST so Open()'s NtioArm run genuinely
+    // arms the driver (rather than being skipped by a stale m_armed=true
+    // from a previous Engine::Init attempt in the same process lifetime).
+    drv.ResetIoBreaker();
+
     if (!drv.Open()) {
         printf(skCrypt("[SysMonitor] Failed to open device\n"));
         return false;
     }
     printf(skCrypt("[SysMonitor] NTIOLib driver ready\n"));
-
-    // Fresh Engine::Init — clear any latched breaker/log state so a previous
-    // startup attempt or user-triggered reload starts clean.
-    drv.ResetIoBreaker();
 
     process = std::make_shared<pProcess>();
 
