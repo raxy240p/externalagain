@@ -46,17 +46,19 @@
 //   refused by the DACL before CREATE runs.
 //
 // Activation gate: before any read/write IOCTL succeeds, the driver's
-// global at 0x140003010 must equal 0x2F405A34 (verified @ 0x1400013c4).
-// User mode arms it via IOCTL 0x2A00 0xC3502000 with the magic word placed
-// in the shared METHOD_BUFFERED buffer's first DWORD (OutputBufferLength
-// must be 4). Once armed it stays armed for the driver's lifetime.
+// arm-global must equal 0x2F405A34. The arm handler is reached ONLY by
+// IOCTL 0xC350214C — it reads SystemBuffer[0..3] (METHOD_BUFFERED,
+// InputLength=4) and, if the dword equals the magic, writes the magic
+// into the arm-global. Any other IOCTL (including the plausible-looking
+// 0xC3502000, which is a DEAD CASE that always returns STATUS_INVALID_HANDLE)
+// won't arm the driver. Once armed it stays armed for the driver's lifetime.
 //
 // IOCTL surface (dispatch on raw IoControlCode, DeviceType 0xC350):
-//   0xC3502000  ARM — set global magic (input+output buf DWORD 0 = magic)
-//   0xC3502004  version stub (writes global +0x14 to caller)
+//   0xC3502000  DEAD — hardwired STATUS_INVALID_HANDLE, do not send
+//   0xC3502004  version stub (writes small global to caller)
 //   0xC3502084  MSR-family write path      (unused here)
 //   0xC3502088  MSR-family read path       (unused here)
-//   0xC350214C  PCI/HW-info stub           (unused here)
+//   0xC350214C  ← ARM — sets global magic (input buf DWORD 0 = magic)
 //   0xC35060C8  I/O port read byte (in al,dx)
 //   0xC35060CC  I/O port read byte alt
 //   0xC35060D0  I/O port read word
@@ -90,13 +92,22 @@
 //     thread.
 //   + No integrity-level gate on CREATE (Corsair required IL >= HIGH;
 //     NTIOLib takes any admin who passes the device DACL)
-//   - Requires one-shot ARM IOCTL (0xC3502000) after Open() before reads
+//   - Requires one-shot ARM IOCTL (0xC350214C) after Open() before reads
 //     work. Handled once in Open()'s probe.
 //   - Device path \Device\NTIOLib_CC_COMM is a known IOC in AC/AV static
 //     scanners. Mitigation: idle-mode reopen keeps the handle out of the
 //     process handle table between scans; the .sys on disk is renamed to
 //     a machine-stable hex; the SCM service name is likewise stable-hex.
-#define IOCTL_NTIO_ARM                  0xC3502000u
+// IOCTL codes verified against the MSI Center 2.0.35.0 v3.0.0.11 build of
+// NTIOLib_X64.sys (SHA256 2A36D9A2...). Extracted from the driver's own
+// dispatch tree in .text: 0xC3502000 is a DEAD CASE that unconditionally
+// returns STATUS_INVALID_HANDLE — the actual arm handler (which reads
+// SystemBuffer[0..3], compares to 0x2F405A34, and writes it into the
+// driver-global arm word) is reached only when IoControlCode == 0xC350214C.
+// Every read IOCTL (0xC3506104 + range) checks that arm-global-magic gate
+// before dispatching MmMapIoSpace, so wrong ARM = every read fails with
+// err=6 (STATUS_INVALID_HANDLE) — exactly what live-fire testing showed.
+#define IOCTL_NTIO_ARM                  0xC350214Cu
 #define IOCTL_NTIO_READ_PHYS            0xC3506104u
 #define IOCTL_NTIO_WRITE_PHYS           0xC350A148u
 #define NTIO_ARM_MAGIC                  0x2F405A34u
