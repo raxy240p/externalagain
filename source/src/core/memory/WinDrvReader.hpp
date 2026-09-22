@@ -314,6 +314,14 @@ public:
             return false;
         }
 
+        // Diagnostic: send VERSION IOCTL (0xC3502004) — no arm-gate check
+        // in that handler, so if it succeeds while READ still fails with
+        // err=6, the problem is arm-global bookkeeping (not handle/dispatch).
+        {
+            uint32_t versionVal = 0;
+            NtioVersionProbe(m_hDevice, versionVal);
+        }
+
         // Step 2: probe the bulk read primitive at PA=0x1000 with a 4-byte
         // dword read. Exercises the full path (input validation + activation
         // gate + MmMapIoSpace succeed + rep movs into output buffer).
@@ -1160,11 +1168,36 @@ private:
         if (m_armed.load(std::memory_order_acquire)) return true;
         uint32_t buf = NTIO_ARM_MAGIC;
         DWORD    returned = 0;
+        SetLastError(0);
         BOOL     ok = DeviceIoControl(h, IOCTL_NTIO_ARM,
                                       &buf, sizeof(buf),
                                       &buf, sizeof(buf),
                                       &returned, nullptr);
+        DWORD    err = GetLastError();
+        printf(skCrypt("[SysMonitor] ARM IOCTL 0x%08X sent (in=4 out=4 magic=0x%08X) -> ok=%d returned=%lu err=%lu buf_after=0x%08X\n"),
+               (unsigned)IOCTL_NTIO_ARM, (unsigned)NTIO_ARM_MAGIC,
+               (int)(ok != FALSE), returned, err, (unsigned)buf);
         if (ok != FALSE) m_armed.store(true, std::memory_order_release);
+        SetLastError(err);
+        return ok != FALSE;
+    }
+
+    // One-shot probe of IOCTL 0xC3502004 (VERSION). If dispatch works at all,
+    // this returns a small dword to the caller. If it fails with err=6 like
+    // ARM/READ do, the driver rejects this handle for ALL IOCTLs — deeper
+    // than arm-global bookkeeping.
+    bool NtioVersionProbe(HANDLE h, uint32_t& outVal) {
+        uint32_t buf = 0;
+        DWORD    returned = 0;
+        SetLastError(0);
+        BOOL ok = DeviceIoControl(h, 0xC3502004u,
+                                  &buf, sizeof(buf),
+                                  &buf, sizeof(buf),
+                                  &returned, nullptr);
+        DWORD err = GetLastError();
+        outVal = buf;
+        printf(skCrypt("[SysMonitor] VERSION IOCTL 0xC3502004 -> ok=%d returned=%lu err=%lu value=0x%08X\n"),
+               (int)(ok != FALSE), returned, err, (unsigned)buf);
         return ok != FALSE;
     }
 
