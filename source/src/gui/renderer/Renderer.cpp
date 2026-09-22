@@ -118,7 +118,10 @@ bool Renderer::HandleState() {
         }
         LOGF(VERBOSE, "Menu toggled to {}", this->isOpen);
 
-        std::thread([]() { AntiDebug::HideThread(); Config::Write(); }).detach();
+        // Menu::Save() runs the accent-sync before Config::Write so a theme
+        // tweak this session actually lands on disk; bare Config::Write would
+        // persist the stale cfg::ui::accent from the previous read.
+        std::thread([]() { AntiDebug::HideThread(); Menu::Save(); }).detach();
     }
 
     if (pressed_end)

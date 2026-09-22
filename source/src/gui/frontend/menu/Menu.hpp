@@ -12,6 +12,12 @@ public:
     static void Render();
     static void CycleAccent();
 
+    // Save the current cfg (with accent-sync) — call from anywhere outside
+    // Menu.cpp that needs a persisted snapshot, e.g. the menu-toggle
+    // autosave in Renderer.cpp. Direct Config::Write bypasses the accent
+    // sync and drops any theme change made this session.
+    static bool Save();
+
     static void RenderStartupHelp();
 
     static ImVec2 GetPos();

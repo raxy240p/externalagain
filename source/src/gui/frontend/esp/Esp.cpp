@@ -11,15 +11,46 @@
 #include "gui/renderer/Renderer.hpp"
 
 // ── Triggerbot ─────────────────────────────────────────────────────────────
-// SendInput MOUSE_LEFTDOWN+LEFTUP pulse when the crosshair overlaps a bone
-// in the selected zone on an alive enemy. Runs from Esp::RenderImpl inside
-// the per-player loop, which already has the fresh view matrix + bones in
-// scope — zero extra work on the read-side. The bound key is polled via
-// GetAsyncKeyState (works for keyboard + mouse VK codes). Cooldown is
-// enforced at the class level so we don't fire N times per frame when a
-// body camps the crosshair.
+// SendInput MOUSE1 pulse when the crosshair overlaps a bone in the selected
+// zone on an alive enemy. Runs from Esp::RenderImpl inside the per-player
+// loop, which already has the fresh view matrix + bones in scope — zero
+// extra work on the read-side. The bound key is polled via
+// GetAsyncKeyState (works for keyboard + mouse VK codes).
+//
+// VAC-hardening on the input side:
+//  • DOWN and UP are SPLIT across frames — DOWN fires now, UP is deferred
+//    to a randomized 30..70 ms later via s_pendingUp; each frame we drain
+//    the deferred UP before doing any new hit-test. Two SendInput calls
+//    with a natural human-click hold time in between instead of a
+//    zero-gap DOWN+UP batch (the classic external-triggerbot signature).
+//  • Inter-shot delay is JITTERED — configured delay_ms is a floor, we
+//    add rand(0..delay_ms/2) so consecutive shots never land at a
+//    perfectly periodic beat. cfg::delay_ms remains the minimum, so
+//    the user's cooldown intent still holds.
+//  • While a click is mid-hold (s_pendingUp set) NO new hit-test runs,
+//    so we never queue a second DOWN on top of an unresolved UP.
+//  • Hold window (30..70 ms) is inside "one CS weapon shot" for even
+//    the fastest RPM (Negev @ 700 RPM = 85 ms between shots), so one
+//    trigger fire = one bullet regardless of weapon fire mode.
 namespace trig {
 	static std::chrono::steady_clock::time_point s_lastShot{};
+	static std::chrono::steady_clock::time_point s_pendingUp{};   // {} = no click in flight
+	static std::chrono::steady_clock::time_point s_nextAllowed{}; // cooldown gate
+
+	// 32-bit LCG for cheap per-frame jitter. Seeded from the process
+	// clock the first time it's used; not cryptographic, doesn't need to be.
+	static uint32_t s_rng = 0;
+	static uint32_t Rand32() {
+		if (!s_rng) s_rng = (uint32_t)std::chrono::steady_clock::now()
+			.time_since_epoch().count() ^ 0x9E3779B9u;
+		s_rng = s_rng * 1664525u + 1013904223u;
+		return s_rng;
+	}
+	// integer in [lo, hi]
+	static int RandRange(int lo, int hi) {
+		if (hi <= lo) return lo;
+		return lo + int(Rand32() % uint32_t(hi - lo + 1));
+	}
 
 	// ImGuiKey → Win32 VK. Keyboard rows are dense in ImGui's enum; letter
 	// keys and digits map linearly. Mouse buttons and the special row use
@@ -76,17 +107,22 @@ namespace trig {
 		}
 	}
 
-	// Single MOUSE1 pulse via SendInput. Uses INPUT_MOUSE with LEFTDOWN then
-	// LEFTUP in one array so the two events go through the input stack
-	// back-to-back, minimizing the window where a game frame could see only
-	// half of the click.
-	static void FireOnce() {
-		INPUT in[2] = {};
-		in[0].type = INPUT_MOUSE;
-		in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-		in[1].type = INPUT_MOUSE;
-		in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
-		SendInput(2, in, sizeof(INPUT));
+	// LMB DOWN half — a single-entry SendInput call. Split from the UP so
+	// the two events don't ship as a zero-interval batch (that pattern is
+	// the classic external-triggerbot fingerprint on the input side).
+	static void FireDown() {
+		INPUT in{};
+		in.type = INPUT_MOUSE;
+		in.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+		SendInput(1, &in, sizeof(INPUT));
+	}
+	// LMB UP half — dispatched later by the frame loop when s_pendingUp
+	// deadline passes, mimicking natural human click-release latency.
+	static void FireUp() {
+		INPUT in{};
+		in.type = INPUT_MOUSE;
+		in.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+		SendInput(1, &in, sizeof(INPUT));
 	}
 }
 
@@ -189,6 +225,15 @@ void Esp::RenderImpl() {
 		return true;
 	}();
 
+	// Drain any pending UP from a previous frame's click — do this every
+	// frame regardless of triggerActive, so a click-in-flight completes
+	// even if the user releases the trigger key mid-hold.
+	if (trig::s_pendingUp.time_since_epoch().count() != 0 && now >= trig::s_pendingUp) {
+		trig::FireUp();
+		trig::s_pendingUp = {};
+	}
+	const bool midClick = (trig::s_pendingUp.time_since_epoch().count() != 0);
+
 	// Cache screen center + zone bone table so the loop just reads
 	const float scrCx = io.DisplaySize.x * 0.5f;
 	const float scrCy = io.DisplaySize.y * 0.5f;
@@ -197,6 +242,7 @@ void Esp::RenderImpl() {
 	if (triggerActive) trig::ZoneBones(cfg::esp::trigger::zone, zoneBones, zoneN);
 	const float hitR2 = cfg::esp::trigger::hit_radius_px * cfg::esp::trigger::hit_radius_px;
 
+#ifdef _DEBUG
 	{
 		static int s_espFrame = 0;
 		if (++s_espFrame % 300 == 1) {
@@ -206,6 +252,7 @@ void Esp::RenderImpl() {
 			       (int)local.team, players.size(), alive_cnt);
 		}
 	}
+#endif
 
 	for (size_t i = 0; i < players.size(); ++i) {
 		const Player& raw = players[i];
@@ -242,28 +289,35 @@ void Esp::RenderImpl() {
 		if (local.index >= 0 && local.index < 64)
 			pred.spotted = (raw.spotted_by_mask >> local.index) & 1u;
 
-		// Triggerbot check — only for alive enemies (mate already excluded above
-		// via team check in the block below is misleading; we re-verify here so
-		// team-visible enemies with ESP-team-off still qualify). Uses predicted
-		// bones so fast-strafing targets don't slip the hit test.
-		if (triggerActive && !mate && pred.alive) {
-			auto sinceLast = std::chrono::duration_cast<std::chrono::milliseconds>(
-				now - trig::s_lastShot).count();
-			if (sinceLast >= (long long)cfg::esp::trigger::delay_ms) {
-				for (int bi = 0; bi < zoneN; ++bi) {
-					int idx = zoneBones[bi];
-					if (idx < 0 || idx >= (int)pred.bone_list.size()) continue;
-					const Vec3_t& bp = pred.bone_list[idx].pos;
-					if (!BoneValid(bp)) continue;
-					Vec2_t sp;
-					if (!matrix.wts(bp, io.DisplaySize, sp)) continue;
-					float dx = sp.x - scrCx;
-					float dy = sp.y - scrCy;
-					if (dx*dx + dy*dy <= hitR2) {
-						trig::FireOnce();
-						trig::s_lastShot = now;
-						break;
-					}
+		// Triggerbot check — never during a mid-click (avoids DOWN-on-DOWN),
+		// never on mates, only on alive targets. Uses PREDICTED bones so
+		// fast-strafing enemies don't slip through the hit test. Cooldown
+		// is gated by s_nextAllowed which carries the current-shot jitter.
+		if (triggerActive && !mate && pred.alive && !midClick && now >= trig::s_nextAllowed) {
+			for (int bi = 0; bi < zoneN; ++bi) {
+				int idx = zoneBones[bi];
+				if (idx < 0 || idx >= (int)pred.bone_list.size()) continue;
+				const Vec3_t& bp = pred.bone_list[idx].pos;
+				if (!BoneValid(bp)) continue;
+				Vec2_t sp;
+				if (!matrix.wts(bp, io.DisplaySize, sp)) continue;
+				float dx = sp.x - scrCx;
+				float dy = sp.y - scrCy;
+				if (dx*dx + dy*dy <= hitR2) {
+					// FIRE — DOWN now, UP deferred to a randomized human-
+					// scale hold time so no zero-gap DOWN+UP batch shows
+					// up on any input-side monitor.
+					trig::FireDown();
+					int holdMs = trig::RandRange(30, 70);
+					trig::s_pendingUp = now + std::chrono::milliseconds(holdMs);
+					// Next allowed shot = configured floor + [0..floor/2] jitter
+					int jitterMax = cfg::esp::trigger::delay_ms / 2;
+					if (jitterMax < 1) jitterMax = 1;
+					int effectiveDelay = cfg::esp::trigger::delay_ms
+						+ trig::RandRange(0, jitterMax);
+					trig::s_nextAllowed = now + std::chrono::milliseconds(effectiveDelay);
+					trig::s_lastShot    = now;
+					break;
 				}
 			}
 		}
