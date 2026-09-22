@@ -104,6 +104,7 @@ bool Player::GetPawn() {
 		p->read_raw_cached(pawn_list_entry + (uint64_t)slot * 0x70, &pawnVal, 8);
 	}
 
+#ifdef _DEBUG
 	static int s_gpLog = 0;
 	if (s_gpLog < 4) {
 		s_gpLog++;
@@ -112,6 +113,7 @@ bool Player::GetPawn() {
 		       (unsigned long long)((pawn_handle & 0x7FFF) >> 9), slot,
 		       (unsigned long long)pawn_list_entry, (unsigned long long)pawnVal);
 	}
+#endif
 
 	if (pawnVal >= kLo && pawnVal < kHi) {
 		this->pawn = pawnVal;
@@ -210,6 +212,7 @@ bool Player::UpdatePawn() {
 		this->alive = true;
 
 	static int s_upLog = 0;
+#ifdef _DEBUG
 	if (s_upLog < 8) {
 		s_upLog++;
 		float px_ = *(float*)(pbuf + offsets::pawn::m_vOldOrigin + 0);
@@ -220,6 +223,9 @@ bool Player::UpdatePawn() {
 		FLog("[UP] idx=%d hp=%d ls=%u alive=%d pos=(%.0f,%.0f,%.0f)\n",
 		     index, rawHp, (unsigned)lifeState, (int)this->alive, px_, py_, pz_);
 	}
+#else
+	(void)s_upLog;
+#endif
 
 	// Team must be read before the alive early-return: fresh Player objects are created
 	// every frame (Cache.cpp line 70), so team stays 0 when dead → local.team=0 → mate
@@ -263,6 +269,7 @@ bool Player::UpdatePawn() {
 	          && fabs(this->pos.y) <= 16384.0f
 	          && fabs(this->pos.z) <= 16384.0f;
 	if (!posOk) {
+#ifdef _DEBUG
 		static int s_pfLog = 0;
 		if (s_pfLog < 4) {
 			s_pfLog++;
@@ -271,6 +278,7 @@ bool Player::UpdatePawn() {
 			FLog("[PF] idx=%d pos=(%.1f,%.1f,%.1f)\n",
 			     index, this->pos.x, this->pos.y, this->pos.z);
 		}
+#endif
 		p->InvalidatePaCacheRange(pawn, sizeof(pbuf));
 		this->alive = false;
 		return false;
@@ -321,6 +329,7 @@ bool Player::UpdatePawn() {
 	}
 	UpdateWeapon(weapon_services);
 
+#ifdef _DEBUG
 	static int s_paLog = 0;
 	if (s_paLog < 4) {
 		s_paLog++;
@@ -331,6 +340,7 @@ bool Player::UpdatePawn() {
 		     index, this->pos.x, this->pos.y, this->pos.z,
 		     (int)this->team, this->bone_list.size(), (int)this->alive);
 	}
+#endif
 
 	return true;
 }

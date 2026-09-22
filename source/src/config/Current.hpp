@@ -102,6 +102,13 @@ namespace cfg {
 		inline int  menu_key = ImGuiKey_Insert;
 	}
 
+	// UI theme — persisted via Config.cpp. Menu.cpp keeps its own runtime
+	// g_accentF ImVec4 for render-hot paths; it syncs to/from cfg::ui::accent
+	// on Load and Save so both stay in step across sessions.
+	namespace ui {
+		inline color_t accent{ 0.259f, 0.529f, 1.f, 1.f };
+	}
+
 #ifdef _DEBUG
 	// Not stored, just for testing
 	namespace dev {

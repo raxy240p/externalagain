@@ -139,6 +139,7 @@ bool Cache::RefreshImpl() {
         scan.push_back(player);
     }
 
+#ifdef _DEBUG
     static bool s_scanLog = false;
     if (!s_scanLog && !scan.empty()) {
         s_scanLog = true;
@@ -152,6 +153,9 @@ bool Cache::RefreshImpl() {
              game.view_matrix.matrix[0][0], game.view_matrix.matrix[0][1],
              game.view_matrix.matrix[0][2], game.view_matrix.matrix[0][3]);
     }
+#else
+    (void)passed_update; (void)local;
+#endif
 
     {
         std::lock_guard<std::mutex> lock(mtx);

@@ -4,6 +4,7 @@
 #include <skCrypter/skCrypter.hpp>
 #include "fonts_embedded.hpp"
 #include "gui/renderer/window/Window.hpp"
+#include "config/Config.hpp"   // Save/Load delegate to the single JSON store
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -81,114 +82,43 @@ static float Stagger()
 }
 
 // ── Config save / load ────────────────────────────────────────────────────────
-struct CfgEntry { const char* key; char type; void* p; };
-static const CfgEntry kCfgEntries[]{
-    {"esp.box",           'b', &cfg::esp::box},
-    {"esp.skeleton",      'b', &cfg::esp::skeleton},
-    {"esp.head_tracker",  'b', &cfg::esp::head_tracker},
-    {"esp.tracers",       'b', &cfg::esp::tracers},
-    {"esp.health",        'b', &cfg::esp::health},
-    {"esp.health_number", 'b', &cfg::esp::health_number},
-    {"esp.armor",         'b', &cfg::esp::armor},
-    {"esp.team",          'b', &cfg::esp::team},
-    {"esp.spotted",       'b', &cfg::esp::spotted},
-    {"esp.spotted_color", 'b', &cfg::esp::spotted_color},
-    {"col.box_spotted",   'c', &cfg::esp::colors::box_spotted},
-    {"esp.box_thickness",      'f', &cfg::esp::box_thickness},
-    {"esp.skeleton_thickness", 'f', &cfg::esp::skeleton_thickness},
-    {"esp.text_size",          'f', &cfg::esp::text_size},
-    {"flags.name",        'b', &cfg::esp::flags::name},
-    {"flags.weapon",      'b', &cfg::esp::flags::weapon},
-    {"flags.ammo",        'b', &cfg::esp::flags::ammo},
-    {"flags.reloading",   'b', &cfg::esp::flags::reloading},
-    {"flags.defusing",    'b', &cfg::esp::flags::defusing},
-    {"flags.money",       'b', &cfg::esp::flags::money},
-    {"flags.flashed",     'b', &cfg::esp::flags::flashed},
-    {"flags.scoped",      'b', &cfg::esp::flags::scoped},
-    {"flags.ping",        'b', &cfg::esp::flags::ping},
-    {"col.box_team",      'c', &cfg::esp::colors::box_team},
-    {"col.box_enemy",     'c', &cfg::esp::colors::box_enemy},
-    {"col.skel_team",     'c', &cfg::esp::colors::skeleton_team},
-    {"col.skel_enemy",    'c', &cfg::esp::colors::skeleton_enemy},
-    {"col.track_team",    'c', &cfg::esp::colors::tracker_team},
-    {"col.track_enemy",   'c', &cfg::esp::colors::tracker_enemy},
-    {"col.tracer_team",   'c', &cfg::esp::colors::tracer_team},
-    {"col.tracer_enemy",  'c', &cfg::esp::colors::tracer_enemy},
-    {"world.spec",        'b', &cfg::world::spectators::enabled},
-    {"world.spec_detail", 'b', &cfg::world::spectators::detailed},
-    {"world.spec_self",   'b', &cfg::world::spectators::self_only},
-    {"world.crosshair",   'b', &cfg::world::crosshair::enabled},
-    {"world.velocity",    'b', &cfg::world::velocity::enabled},
-    {"set.streamproof",   'b', &cfg::settings::streamproof},
-    {"set.watermark",     'b', &cfg::settings::watermark},
-    {"set.vsync",         'b', &cfg::settings::vsync},
-    {"set.free_cpu",      'b', &cfg::settings::free_cpu},
-    {"bind.menu_key",     'i', &cfg::settings::menu_key},
-    {"theme.accent",      'a', &g_accentF},
-    {"trig.enabled",      'b', &cfg::esp::trigger::enabled},
-    {"trig.key",          'i', &cfg::esp::trigger::key},
-    {"trig.zone",         'i', &cfg::esp::trigger::zone},
-    {"trig.hit_radius",   'f', &cfg::esp::trigger::hit_radius_px},
-    {"trig.delay_ms",     'i', &cfg::esp::trigger::delay_ms},
-    {"trig.ign_flashed",  'b', &cfg::esp::trigger::ignore_flashed},
-};
+// Thin bridge to the JSON Config store: keeps everything (colors, sliders,
+// binds, trigger, theme) in ONE file at ONE format. The g_accentF <-> cfg::ui
+// sync lives here because g_accentF is a Menu-local ImVec4 while persistence
+// works in cfg::ui::accent (color_t). Both are single-thread so no lock needed.
+static void SyncAccentToCfg()
+{
+    cfg::ui::accent.r = g_accentF.x;
+    cfg::ui::accent.g = g_accentF.y;
+    cfg::ui::accent.b = g_accentF.z;
+    cfg::ui::accent.a = 1.f;
+}
+static void SyncAccentFromCfg()
+{
+    g_accentF = { cfg::ui::accent.r, cfg::ui::accent.g, cfg::ui::accent.b, 1.f };
+}
 
 static char   s_cfgMsg[32] = "";
 static double s_cfgMsgT    = -100.0;
 static void CfgToast(const char* m)
 { snprintf(s_cfgMsg, sizeof(s_cfgMsg), "%s", m); s_cfgMsgT = ImGui::GetTime(); }
 
-static void CfgFilePath(char* out, size_t n)
-{
-    DWORD len = GetModuleFileNameA(nullptr, out, (DWORD)n);
-    while (len && out[len - 1] != '\\') len--;
-    snprintf(out + len, n - len, "%s", skCrypt("config.json"));
-}
-
 static bool SaveConfig()
 {
-    char path[MAX_PATH]; CfgFilePath(path, sizeof(path));
-    FILE* f = fopen(path, "w");
-    if (!f) return false;
-    for (const auto& e : kCfgEntries) {
-        switch (e.type) {
-        case 'b': fprintf(f, "%s %d\n",             e.key, *(bool*)e.p ? 1 : 0); break;
-        case 'i': fprintf(f, "%s %d\n",             e.key, *(int*)e.p);           break;
-        case 'f': fprintf(f, "%s %.3f\n",           e.key, *(float*)e.p);         break;
-        case 'c': { auto* c = (color_t*)e.p;
-                    fprintf(f, "%s %.3f %.3f %.3f %.3f\n", e.key, c->r, c->g, c->b, c->a); } break;
-        case 'a': { auto* a = (ImVec4*)e.p;
-                    fprintf(f, "%s %.3f %.3f %.3f\n", e.key, a->x, a->y, a->z); } break;
-        }
-    }
-    fclose(f);
-    return true;
+    SyncAccentToCfg();
+    return Config::Write();
 }
 
 static bool LoadConfig()
 {
-    char path[MAX_PATH]; CfgFilePath(path, sizeof(path));
-    FILE* f = fopen(path, "r");
-    if (!f) return false;
-    char line[160], key[64];
-    while (fgets(line, sizeof(line), f)) {
-        if (sscanf(line, "%63s", key) != 1) continue;
-        for (const auto& e : kCfgEntries) {
-            if (strcmp(e.key, key) != 0) continue;
-            const char* rest = line + strlen(key);
-            switch (e.type) {
-            case 'b': { int x; if (sscanf(rest, "%d", &x) == 1) *(bool*)e.p = (x != 0); } break;
-            case 'i': sscanf(rest, "%d",   (int*)e.p); break;
-            case 'f': sscanf(rest, "%f", (float*)e.p); break;
-            case 'c': { auto* c = (color_t*)e.p;
-                        sscanf(rest, "%f %f %f %f", &c->r, &c->g, &c->b, &c->a); } break;
-            case 'a': { auto* a = (ImVec4*)e.p;
-                        sscanf(rest, "%f %f %f", &a->x, &a->y, &a->z); } break;
-            }
-            break;
-        }
-    }
-    fclose(f);
+    if (!Config::Read()) return false;
+    SyncAccentFromCfg();
+    // Streamproof affinity + VSync toggle apply immediately on load so
+    // the runtime state matches the freshly-restored cfg — otherwise
+    // the user would have to touch each toggle to re-apply it.
+    Window::SetAffinity(Window::hwnd, cfg::settings::streamproof
+                        ? WindowAffinity::Invisible : WindowAffinity::Disabled);
+    Window::vsync = cfg::settings::vsync;
     return true;
 }
 
@@ -932,6 +862,7 @@ void Menu::CycleAccent()
 
 bool   Menu::Init()              { return GetInstance().InitImpl(); }
 void   Menu::Render()            { GetInstance().RenderImpl(); }
+bool   Menu::Save()              { return SaveConfig(); }
 ImVec2 Menu::GetPos()            { return GetInstance().pos; }
 ImVec2 Menu::GetSize()           { return GetInstance().size; }
 void   Menu::RenderStartupHelp() { GetInstance().RenderStartupHelpImpl(); }
@@ -940,6 +871,10 @@ bool Menu::InitImpl()
 {
     if (!isSetup) return true;
     SetupStyles();
+    // Pull persisted accent forward — Config::Read fired earlier in
+    // Engine::Init(), so cfg::ui::accent already carries the user's last
+    // choice (or the default). Menu's g_accentF holds the runtime copy.
+    SyncAccentFromCfg();
     isSetup = false;
     return true;
 }

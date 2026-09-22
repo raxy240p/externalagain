@@ -1,7 +1,20 @@
 #include "Config.hpp"
 #include <skCrypter/skCrypter.hpp>
+#include <Windows.h>
 
-#define CFG_PATH (skCrypt("config.json"))
+// Module-relative config path — resolves next to the exe rather than CWD,
+// so autostart/shortcut launches still hit the same file the user's UI
+// Save/Load buttons operate on. Consolidates the previous split where
+// Menu.cpp used module-relative and Config.cpp used CWD-relative.
+static std::string CfgPath()
+{
+	char buf[MAX_PATH]{};
+	DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+	while (n && buf[n - 1] != '\\' && buf[n - 1] != '/') n--;
+	std::string p(buf, n);
+	p.append(skCrypt("config.json"));
+	return p;
+}
 
 bool Config::Read() {
 	return GetInstance().ReadImpl();
@@ -12,7 +25,7 @@ bool Config::Write() {
 }
 
 bool Config::ReadImpl() {
-	std::ifstream f(CFG_PATH);
+	std::ifstream f(CfgPath());
 
 	if (!f.good()) {
 		LOGF(FATAL, "Configuration file does not exist, creating a new one");
@@ -101,6 +114,22 @@ bool Config::ReadImpl() {
 		cfg::settings::vsync = data["utils"].value("vsync", true);
 		cfg::settings::free_cpu = data["utils"].value("free_cpu", true);
 		//cfg::settings::open_menu_key = data["utils"].value("open_menu_key", 0);
+
+		// trigger (esp.trigger.* — nested under esp for locality)
+		if (data["esp"].contains("trigger")) {
+			const auto& t = data["esp"]["trigger"];
+			cfg::esp::trigger::enabled        = t.value("enabled",        false);
+			cfg::esp::trigger::key            = t.value("key",            (int)ImGuiKey_MouseX1);
+			cfg::esp::trigger::zone           = t.value("zone",           0);
+			cfg::esp::trigger::hit_radius_px  = t.value("hit_radius_px",  4.0f);
+			cfg::esp::trigger::delay_ms       = t.value("delay_ms",       90);
+			cfg::esp::trigger::ignore_flashed = t.value("ignore_flashed", true);
+			cfg::esp::trigger::ignore_smoked  = t.value("ignore_smoked",  false);
+		}
+
+		// ui theme
+		cfg::ui::accent = JsonToColor(data["ui"], "accent",
+			{ 0.259f, 0.529f, 1.f, 1.f });
 	}
 	catch (const std::exception& e) {
 		LOGF(FATAL, "Failed to parse configuration");
@@ -113,7 +142,7 @@ bool Config::ReadImpl() {
 }
 
 bool Config::WriteImpl() {
-	std::ofstream f(CFG_PATH);
+	std::ofstream f(CfgPath());
 
 	json data;
 
@@ -182,6 +211,19 @@ bool Config::WriteImpl() {
 	data["utils"]["free_cpu"] = cfg::settings::free_cpu;
 	data["utils"]["menu_key"] = cfg::settings::menu_key;
 	//data["utils"]["open_menu_key"] = cfg::settings::open_menu_key;
+
+	// trigger
+	auto& t = data["esp"]["trigger"];
+	t["enabled"]        = cfg::esp::trigger::enabled;
+	t["key"]            = cfg::esp::trigger::key;
+	t["zone"]           = cfg::esp::trigger::zone;
+	t["hit_radius_px"]  = cfg::esp::trigger::hit_radius_px;
+	t["delay_ms"]       = cfg::esp::trigger::delay_ms;
+	t["ignore_flashed"] = cfg::esp::trigger::ignore_flashed;
+	t["ignore_smoked"]  = cfg::esp::trigger::ignore_smoked;
+
+	// ui theme
+	ColorToJson(data["ui"], "accent", cfg::ui::accent);
 
 	f << std::setw(4) << data << std::endl;
 	f.close();
