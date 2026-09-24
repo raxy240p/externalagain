@@ -37,16 +37,15 @@ bool Engine::InitImpl() {
 
     printf(skCrypt("[SysMonitor] starting...\n"));
 
-    // Reset breaker/armed state FIRST so Open()'s NtioArm run genuinely
-    // arms the driver (rather than being skipped by a stale m_armed=true
-    // from a previous Engine::Init attempt in the same process lifetime).
+    // Reset breaker state FIRST so a previous Engine::Init attempt in the
+    // same process lifetime doesn't leave the circuit breaker latched.
     drv.ResetIoBreaker();
 
     if (!drv.Open()) {
         printf(skCrypt("[SysMonitor] Failed to open device\n"));
         return false;
     }
-    printf(skCrypt("[SysMonitor] NTIOLib driver ready\n"));
+    printf(skCrypt("[SysMonitor] RTCore64 driver ready\n"));
 
     process = std::make_shared<pProcess>();
 
