@@ -121,6 +121,52 @@ struct NtioReadReq {
 static_assert(sizeof(NtioReadReq) == 0x10, "NTIOLib read req size");
 #pragma pack(pop)
 
+// Candidate on-wire request shapes tried by ReadScan when the standard
+// 16-byte NtioReadReq is rejected by this driver build. Empirical — some
+// NTIOLib patch levels shipped in MSI Center bundles use a 20-byte
+// prefixed shape (a leading 4-byte "channel" or "unlock cookie"), and
+// legacy MsIo64-style dispatchers use a 12-byte {pa32_lo, pa32_hi, size}
+// packet. If none work, Open() reports FAILED with the enumerated log
+// so we can extend the shape table with the actually-required layout.
+enum class NtioReadShape : uint8_t {
+    STD_16   = 0,   // {u64 pa, u32 unit, u32 count}                — canonical
+    PADDED_20,      // {u32 pad, u64 pa, u32 unit, u32 count}       — MSI variant
+    LEGACY_12,      // {u32 pa_lo, u32 pa_hi, u32 size_bytes}       — MsIo64 style
+    SIZE_16,        // {u64 pa, u64 size_bytes}                     — byte-oriented
+    kCount
+};
+
+// Fills `out` with the on-wire request bytes and returns the InputBufferLength
+// to send. `out` must be at least 32 bytes; unused shapes return 0.
+inline size_t BuildReadRequestBytes(NtioReadShape shape, uint64_t pa, uint32_t unit,
+                                    uint32_t count, uint8_t out[32]) {
+    memset(out, 0, 32);
+    switch (shape) {
+    case NtioReadShape::STD_16:
+        *(uint64_t*)(out + 0) = pa;
+        *(uint32_t*)(out + 8) = unit;
+        *(uint32_t*)(out + 12) = count;
+        return 16;
+    case NtioReadShape::PADDED_20:
+        *(uint32_t*)(out + 0)  = 0;
+        *(uint64_t*)(out + 4)  = pa;
+        *(uint32_t*)(out + 12) = unit;
+        *(uint32_t*)(out + 16) = count;
+        return 20;
+    case NtioReadShape::LEGACY_12:
+        *(uint32_t*)(out + 0) = (uint32_t)pa;
+        *(uint32_t*)(out + 4) = (uint32_t)(pa >> 32);
+        *(uint32_t*)(out + 8) = unit * count;
+        return 12;
+    case NtioReadShape::SIZE_16:
+        *(uint64_t*)(out + 0) = pa;
+        *(uint64_t*)(out + 8) = (uint64_t)unit * count;
+        return 16;
+    default: break;
+    }
+    return 0;
+}
+
 // NTIOLib IOCTL 0xC3506104 return-contract summary (from disassembly):
 //
 //   Path                                     IoStatus.Status       Information
@@ -181,6 +227,21 @@ public:
     bool Open() {
         if (IsOpen()) return true;
         DBG_PRINT("[ntio] Opening device...\n");
+
+        // RAII: suppresses NtioReadOnce's handle-close-on-HandleStale for
+        // the entire probe flow. Without this, the first failed READ probe
+        // closes m_hDevice, and every subsequent arm-scan / read-scan
+        // variant runs against INVALID_HANDLE_VALUE — the log floods with
+        // err=6 uniformly (because that's what DeviceIoControl returns for
+        // a bad handle) and we lose the ability to distinguish real driver
+        // rejection from our own self-inflicted handle close.
+        struct ProbeGuard {
+            std::atomic<bool>* flag;
+            ProbeGuard(std::atomic<bool>* f) : flag(f) {
+                flag->store(true, std::memory_order_release);
+            }
+            ~ProbeGuard() { flag->store(false, std::memory_order_release); }
+        } _probeGuard(&m_openProbeInProgress);
         // Try each (path, access) pair. First success wins — but we now
         // track WHICH combo won so ARM failures can escalate by re-opening
         // with a stronger access mode. Prior behavior would silently pick
@@ -328,17 +389,35 @@ public:
         uint32_t probe = 0;
         bool ok = NtioReadOnce(0x1000, 4, 1, &probe, sizeof(probe));
 
-        // Empirical fallback: static analysis said 0xC350214C+magic-4bytes
-        // should arm this driver, but dj's live-fire shows the arm state
-        // doesn't stick. Try other candidate IOCTL/buffer combos until
-        // one makes the READ probe succeed. If none does, we still fail
-        // below, but the log identifies which candidates were tried.
+        // Empirical read-shape fallback. ARM succeeded (ok=1) and VERSION
+        // succeeded, but the driver rejected the standard 16-byte
+        // NtioReadReq at 0xC3506104 with err=6. That means this build
+        // either uses a different on-wire shape for the read struct
+        // (PADDED_20, LEGACY_12, SIZE_16) or dispatches read through
+        // 0xC3506144 (documented as the cached-mapping variant). ReadScan
+        // enumerates the {IOCTL × shape} matrix; if any combo returns
+        // ok=1 with 4 bytes, latch it into m_readIoctlIdx/m_readShapeIdx
+        // so the hot path uses it and continue.
         if (!ok) {
-            printf(skCrypt("[SysMonitor] first probe failed -- running empirical arm-scan\n"));
+            printf(skCrypt("[SysMonitor] standard read probe failed -- running read-shape scan\n"));
+            if (ReadScan(m_hDevice)) {
+                probe = 0;
+                ok = NtioReadOnce(0x1000, 4, 1, &probe, sizeof(probe));
+            }
+        }
+
+        // Arm-shape fallback: the 24-candidate ARM enumeration. Only
+        // meaningful when the handle survives — ProbeGuard above ensures
+        // it does. ArmScan reopens the handle itself as a defense in
+        // depth if something else closed it in the meantime.
+        if (!ok) {
+            printf(skCrypt("[SysMonitor] read-scan failed -- running empirical arm-scan\n"));
             if (ArmScan(m_hDevice)) {
+                // ArmScan validated with the canonical shape internally,
+                // so reset the hot path to it.
+                m_readIoctlIdx.store(0, std::memory_order_release);
+                m_readShapeIdx.store(0, std::memory_order_release);
                 ok = true;
-                // Re-run the "canonical" probe path so downstream logic sees
-                // it succeed; ArmScan already validated with its own probe.
                 probe = 0;
                 NtioReadOnce(0x1000, 4, 1, &probe, sizeof(probe));
             }
@@ -347,12 +426,14 @@ public:
         if (!ok) {
             printf(skCrypt("[SysMonitor] NTIOLib probe FAILED (err=%lu) -- driver up + armed but IOCTL 0xC3506104 blocked\n"),
                    GetLastError());
-            CloseHandle(m_hDevice);
+            if (m_hDevice != INVALID_HANDLE_VALUE) CloseHandle(m_hDevice);
             m_hDevice = INVALID_HANDLE_VALUE;
             return false;
         }
-        printf(skCrypt("[SysMonitor] NTIOLib probe OK  PA=0x1000 dword -> 0x%08X\n"),
-               (unsigned)probe);
+        printf(skCrypt("[SysMonitor] NTIOLib probe OK  PA=0x1000 dword -> 0x%08X  (ioctl=0x%08X shape=%u)\n"),
+               (unsigned)probe,
+               (unsigned)kReadIoctls[m_readIoctlIdx.load(std::memory_order_acquire) & 1],
+               (unsigned)m_readShapeIdx.load(std::memory_order_acquire));
         return true;
     }
 
@@ -1261,6 +1342,24 @@ private:
     // static-analysis path fails. Brute-force expansion: 24 candidates
     // covering every reasonable input pattern the driver might expect.
     bool ArmScan(HANDLE h) {
+        // Defense in depth: if the handle went invalid between Open()'s
+        // ARM step and here, reopen so the arm-scan probes hit the driver
+        // instead of ERROR_INVALID_HANDLE.
+        if (h == INVALID_HANDLE_VALUE) {
+            HANDLE nh = CreateFileA(GetDevicePath(),
+                                    GENERIC_READ | GENERIC_WRITE,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    nullptr, OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (nh == INVALID_HANDLE_VALUE) {
+                printf(skCrypt("[SysMonitor] arm-scan: could not reopen device (err=%lu)\n"),
+                       GetLastError());
+                return false;
+            }
+            m_hDevice = nh;
+            h = nh;
+            printf(skCrypt("[SysMonitor] arm-scan: reopened device handle=0x%p\n"), (void*)h);
+        }
         printf(skCrypt("[SysMonitor] arm-scan: probing 24 arm candidates...\n"));
         m_armed.store(false, std::memory_order_release);
 
@@ -1311,6 +1410,52 @@ private:
                 m_armed.store(true, std::memory_order_release);
                 printf(skCrypt("[SysMonitor] arm-scan WON with [%s]\n"), c.tag);
                 return true;
+            }
+        }
+        return false;
+    }
+
+    // Read-primitive scan. Walks the {IOCTL code × request shape} matrix
+    // for a probe of PA 0x1000 dword-read. When the standard 16-byte
+    // NtioReadReq at 0xC3506104 returns err=6 despite the driver being
+    // armed (ARM ok, VERSION ok), the wire shape or the read IOCTL number
+    // itself is what this build rejects — not the arm state. If any
+    // combo wins, latch it into m_readIoctlIdx / m_readShapeIdx so the
+    // hot path uses it, then return true. Caller must guarantee the
+    // handle is valid.
+    bool ReadScan(HANDLE h) {
+        if (h == INVALID_HANDLE_VALUE) {
+            printf(skCrypt("[SysMonitor] read-scan: handle invalid, skipping\n"));
+            return false;
+        }
+        printf(skCrypt("[SysMonitor] read-scan: probing IOCTL/shape combos...\n"));
+        const uint8_t nShapes = (uint8_t)NtioReadShape::kCount;
+        const uint8_t nIoctls = (uint8_t)(sizeof(kReadIoctls) / sizeof(kReadIoctls[0]));
+        for (uint8_t ci = 0; ci < nIoctls; ci++) {
+            for (uint8_t si = 0; si < nShapes; si++) {
+                uint8_t req[32] = {};
+                size_t inBytes = BuildReadRequestBytes(
+                    (NtioReadShape)si, 0x1000, 4, 1, req);
+                if (!inBytes) continue;
+                uint32_t out = 0;
+                DWORD returned = 0;
+                SetLastError(0);
+                BOOL ok = DeviceIoControl(h, kReadIoctls[ci],
+                                          req, (DWORD)inBytes,
+                                          &out, sizeof(out),
+                                          &returned, nullptr);
+                DWORD err = GetLastError();
+                printf(skCrypt("[SysMonitor] read-scan [ioctl=0x%08X shape=%u in=%zu]: "
+                               "ok=%d returned=%lu err=%lu value=0x%08X\n"),
+                       (unsigned)kReadIoctls[ci], (unsigned)si, inBytes,
+                       (int)(ok != FALSE), returned, err, (unsigned)out);
+                if (ok != FALSE && returned == sizeof(out)) {
+                    m_readIoctlIdx.store(ci, std::memory_order_release);
+                    m_readShapeIdx.store(si, std::memory_order_release);
+                    printf(skCrypt("[SysMonitor] read-scan WON: ioctl=0x%08X shape=%u\n"),
+                           (unsigned)kReadIoctls[ci], (unsigned)si);
+                    return true;
+                }
             }
         }
         return false;
@@ -1405,14 +1550,18 @@ private:
             return false;
         }
 
-        NtioReadReq req{};
-        req.phys_addr = physAddr;
-        req.unit_size = unit_size;
-        req.count     = count;
+        uint8_t reqBuf[32] = {};
+        uint8_t shapeIdx = m_readShapeIdx.load(std::memory_order_acquire);
+        uint8_t ioctlIdx = m_readIoctlIdx.load(std::memory_order_acquire);
+        if (shapeIdx >= (uint8_t)NtioReadShape::kCount) shapeIdx = 0;
+        if (ioctlIdx >= 2) ioctlIdx = 0;
+        size_t inBytes = BuildReadRequestBytes(
+            (NtioReadShape)shapeIdx, physAddr, unit_size, count, reqBuf);
+        uint32_t code = kReadIoctls[ioctlIdx];
 
         DWORD returned = 0;
-        BOOL  ok = DeviceIoControl(hUse, IOCTL_NTIO_READ_PHYS,
-                                   &req, sizeof(req),
+        BOOL  ok = DeviceIoControl(hUse, code,
+                                   reqBuf, (DWORD)inBytes,
                                    out_data, (DWORD)bytes,
                                    &returned, nullptr);
 
@@ -1436,8 +1585,8 @@ private:
         if (cls == SivFail::Transient) {
             Sleep(0);
             returned = 0;
-            ok = DeviceIoControl(hUse, IOCTL_NTIO_READ_PHYS,
-                                 &req, sizeof(req),
+            ok = DeviceIoControl(hUse, code,
+                                 reqBuf, (DWORD)inBytes,
                                  out_data, (DWORD)bytes,
                                  &returned, nullptr);
             if (ok != FALSE && returned == (DWORD)bytes) cls = SivFail::Ok;
@@ -1452,7 +1601,13 @@ private:
         //      unload, so the reopen must re-ARM. Without this, m_armed
         //      stays true, NtioArm short-circuits, and every subsequent
         //      read fails permanently until the user restarts the cheat.
-        if (cls == SivFail::HandleStale) {
+        //
+        // Exception: during Open()'s probe path (m_openProbeInProgress),
+        // an err=6 from an unknown-shape probe doesn't mean the handle
+        // died — it means the driver rejected THIS shape. Closing the
+        // handle here would blind the shape-scan and arm-scan that follow.
+        if (cls == SivFail::HandleStale
+            && !m_openProbeInProgress.load(std::memory_order_acquire)) {
             EnterCriticalSection(&m_physLock);
             if (m_hDevice != INVALID_HANDLE_VALUE) {
                 CloseHandle(m_hDevice);
@@ -1961,4 +2116,20 @@ private:
     // redundant ARM syscall on every idle-mode reopen.
     std::atomic<bool>     m_armed              {false};
     std::atomic<int>      m_failLogCounts[kFailLogSlots] {};
+
+    // Set while Open()'s probe path is running. Suppresses NtioReadOnce's
+    // handle-close-on-HandleStale side-effect so ArmScan/ReadScan still
+    // see a live handle after the first probe returns err=6. Without this
+    // guard the first failed probe closes m_hDevice, every subsequent
+    // arm-scan variant runs against INVALID_HANDLE_VALUE, and the log
+    // shows err=6 uniformly across 24 candidates — masking whatever the
+    // driver actually thinks about them.
+    std::atomic<bool>     m_openProbeInProgress {false};
+
+    // Active read-primitive shape. ReadScan populates these when the
+    // default (ioctl=0xC3506104, standard 16-byte request) is rejected
+    // by this driver build. Rest of the hot path reads them per-call.
+    static constexpr uint32_t kReadIoctls[2] = { 0xC3506104u, 0xC3506144u };
+    std::atomic<uint8_t>  m_readIoctlIdx       {0};
+    std::atomic<uint8_t>  m_readShapeIdx       {0};
 };
