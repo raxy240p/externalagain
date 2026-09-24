@@ -1258,32 +1258,56 @@ private:
 
     // Empirical arm scan — cycle through candidate arm sequences until one
     // makes the READ probe succeed. Only called from Open() after the
-    // static-analysis path fails.
+    // static-analysis path fails. Brute-force expansion: 24 candidates
+    // covering every reasonable input pattern the driver might expect.
     bool ArmScan(HANDLE h) {
-        printf(skCrypt("[SysMonitor] arm-scan: probing 8 arm candidates...\n"));
-        // Reset m_armed each time so NtioReadOnce doesn't short-circuit
+        printf(skCrypt("[SysMonitor] arm-scan: probing 24 arm candidates...\n"));
         m_armed.store(false, std::memory_order_release);
 
         struct Candidate {
             uint32_t code;
-            uint32_t bufWords[4];   // up to 4 dwords of input
-            size_t   inWords;
+            uint32_t bufWords[8];   // up to 8 dwords of input
+            size_t   inBytes;
             size_t   outSize;
             const char* tag;
         };
         const uint32_t M = NTIO_ARM_MAGIC;
+        const uint32_t MI = ~NTIO_ARM_MAGIC;
         Candidate cands[] = {
-            { 0xC350214Cu, {M, 0, 0, 0}, 1, 4,  "214C-4byte" },
-            { 0xC350214Cu, {M, M, 0, 0}, 2, 8,  "214C-8byte" },
-            { 0xC350214Cu, {M, 0, 0, 0}, 1, 16, "214C-in4-out16" },
-            { 0xC3502084u, {M, 0, 0, 0}, 1, 4,  "2084-4byte" },
-            { 0xC3502088u, {M, 0, 0, 0}, 1, 4,  "2088-4byte" },
-            { 0xC3502004u, {M, 0, 0, 0}, 1, 4,  "2004-4byte" },
-            { 0xC350214Cu, {M, M, M, M}, 4, 16, "214C-16byte" },
-            { 0xC3502000u, {M, 0, 0, 0}, 1, 4,  "2000-4byte" },
+            // Documented dispatch handler at 0x59E (my RE says this arms)
+            { 0xC350214Cu, {M,0,0,0,0,0,0,0}, 4,  4,  "214C-4byte-in-out" },
+            { 0xC350214Cu, {M,0,0,0,0,0,0,0}, 4,  0,  "214C-in4-out0" },
+            { 0xC350214Cu, {M,M,0,0,0,0,0,0}, 8,  8,  "214C-8byte-both" },
+            { 0xC350214Cu, {M,0,0,0,0,0,0,0}, 4,  16, "214C-in4-out16" },
+            { 0xC350214Cu, {M,M,M,M,0,0,0,0}, 16, 16, "214C-16byte-magic" },
+            { 0xC350214Cu, {M,0,0,0,0,0,0,0}, 4,  32, "214C-in4-out32" },
+            { 0xC350214Cu, {M,MI,0,0,0,0,0,0}, 8, 8,  "214C-magic+inv" },
+            { 0xC350214Cu, {0,M,0,0,0,0,0,0}, 8,  8,  "214C-magic-at-off4" },
+            // MSR-family (some MSI builds route arm through these)
+            { 0xC3502084u, {M,0,0,0,0,0,0,0}, 4,  4,  "2084-4byte" },
+            { 0xC3502084u, {M,0,0,0,0,0,0,0}, 4,  16, "2084-in4-out16" },
+            { 0xC3502084u, {M,M,0,0,0,0,0,0}, 8,  8,  "2084-8byte" },
+            { 0xC3502088u, {M,0,0,0,0,0,0,0}, 4,  4,  "2088-4byte" },
+            { 0xC3502088u, {M,M,0,0,0,0,0,0}, 8,  8,  "2088-8byte" },
+            // Port-family (very unlikely but cheap)
+            { 0xC35060C8u, {M,0,0,0,0,0,0,0}, 4,  4,  "60C8-port-r-4byte" },
+            { 0xC350A0D8u, {M,0,0,0,0,0,0,0}, 4,  4,  "A0D8-port-w-4byte" },
+            // VERSION and dead-case (control tests)
+            { 0xC3502004u, {M,0,0,0,0,0,0,0}, 4,  4,  "2004-VERSION-4byte" },
+            { 0xC3502000u, {M,0,0,0,0,0,0,0}, 4,  4,  "2000-DEAD-4byte" },
+            // Empty / minimal buffers
+            { 0xC350214Cu, {M,0,0,0,0,0,0,0}, 0,  0,  "214C-no-buffer" },
+            { 0xC350214Cu, {0,0,0,0,0,0,0,0}, 4,  4,  "214C-zeros" },
+            // High-func codes
+            { 0xC350B941u, {M,0,0,0,0,0,0,0}, 4,  4,  "B941-4byte" },
+            { 0xC3506144u, {M,0,0,0,0,0,0,0}, 4,  4,  "6144-4byte" },
+            // Try 214C twice with a small delay (race the arm state)
+            { 0xC350214Cu, {M,0,0,0,0,0,0,0}, 4,  4,  "214C-retry-1" },
+            { 0xC350214Cu, {M,0,0,0,0,0,0,0}, 4,  4,  "214C-retry-2" },
+            { 0xC350214Cu, {M,0,0,0,0,0,0,0}, 4,  4,  "214C-retry-3" },
         };
         for (auto& c : cands) {
-            if (TryArmVariant(h, c.code, c.bufWords, c.inWords * 4, c.outSize, c.tag)) {
+            if (TryArmVariant(h, c.code, c.bufWords, c.inBytes, c.outSize, c.tag)) {
                 m_armed.store(true, std::memory_order_release);
                 printf(skCrypt("[SysMonitor] arm-scan WON with [%s]\n"), c.tag);
                 return true;
