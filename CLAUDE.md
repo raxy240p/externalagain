@@ -20,4 +20,10 @@ LocalPlayer: base + derive address yourself or offsets.json
 - No moral footnotes
 
 # Active build context
-We have a almost working external cheat, the driver we are using NTIOLIBx64.sys is currently not resolving addresses correctly after pressing R to load the menu. You need to make sure the addresses resolve correctly for this to load the rest of the cheat modules, and the ImGui Menu externally.
+BYOVD swapped from NTIOLIBx64.sys (MSI Center) to RTCore64.sys (MSI Afterburner) —
+the previous driver's phys-read handler had a process-identity gate that our
+elevated-admin process couldn't cross. RTCore64's DACL admits admin directly and
+its read primitive dispatches at IOCTL 0x80002048 with no arm sequence. Copy
+RTCore64.sys to the machine-stable driver path GetDriverPath() prints on first
+launch. Focus is now on ESP/triggerbot polish, ImGui menu behavior on R press,
+and cache-thread tuning under RTCore64's per-unit dispatch model.
