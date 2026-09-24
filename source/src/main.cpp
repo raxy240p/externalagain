@@ -715,6 +715,52 @@ int main()
     // happy path.
     EnableAdminPrivileges();
 
+    // MSI Center's helper processes periodically open NTIOLib_CC_COMM and
+    // send their own IOCTLs. The arm handler at RVA 0x59E PRE-CLEARS the
+    // arm-global before checking the input buffer — meaning any MSI IOCTL
+    // that doesn't send the exact 4-byte magic will clear our arm state.
+    // If an MSI helper races us between our ARM and our READ, arm_global
+    // gets zeroed and READ fails with err=6. Kill them proactively.
+    {
+        auto pCreateToolhelp32Snapshot = RESOLVE(CreateToolhelp32Snapshot);
+        auto pProcess32First           = RESOLVE(Process32First);
+        auto pProcess32Next            = RESOLVE(Process32Next);
+        auto pOpenProcess              = RESOLVE(OpenProcess);
+        auto pTerminateProcess         = RESOLVE(TerminateProcess);
+        auto pCloseHandle              = RESOLVE(CloseHandle);
+        if (pCreateToolhelp32Snapshot && pProcess32First && pProcess32Next
+            && pOpenProcess && pTerminateProcess && pCloseHandle) {
+            HANDLE snap = pCreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snap != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32 pe = { sizeof(pe) };
+                int killed = 0;
+                if (pProcess32First(snap, &pe)) {
+                    do {
+                        const char* n = pe.szExeFile;
+                        if (_stricmp(n, skCrypt("MSI Center.exe")) == 0 ||
+                            _stricmp(n, skCrypt("MSICenter.exe")) == 0 ||
+                            _stricmp(n, skCrypt("MSI_Central_Service.exe")) == 0 ||
+                            _stricmp(n, skCrypt("Dragon Center.exe")) == 0 ||
+                            _stricmp(n, skCrypt("MSIAfterburner.exe")) == 0 ||
+                            _stricmp(n, skCrypt("HardwareMonitor.exe")) == 0) {
+                            HANDLE hp = pOpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                            if (hp) {
+                                if (pTerminateProcess(hp, 0)) killed++;
+                                pCloseHandle(hp);
+                            }
+                        }
+                    } while (pProcess32Next(snap, &pe));
+                }
+                pCloseHandle(snap);
+                if (killed) {
+                    std::cout << "  \033[96m[*]\033[0m Stopped " << killed
+                              << " MSI helper process(es) to prevent arm-state race.\n";
+                    Sleep(500);   // let their handle-close IRPs drain
+                }
+            }
+        }
+    }
+
     // NTIOLib publishes \Device\NTIOLib_CC_COMM at DriverEntry — the path
     // is hardcoded in the signed driver's .rdata and can't be changed
     // without breaking the signature. WinDrvReader already knows the
