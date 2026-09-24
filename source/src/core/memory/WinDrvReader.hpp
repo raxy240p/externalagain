@@ -242,6 +242,28 @@ public:
             }
             ~ProbeGuard() { flag->store(false, std::memory_order_release); }
         } _probeGuard(&m_openProbeInProgress);
+
+        // Dump the current process context so the log carries the identity
+        // that reached the driver. When 6104 rejects with err=6 despite ARM
+        // working, the delta between our context and MSI Center's (which
+        // succeeds) is where the guard lives.
+        LogProcessContext("before-impersonate");
+
+        // Try SYSTEM impersonation. Hardened NTIOLib builds gate MmMapIoSpace
+        // ops on caller integrity level; MSI Center's service runs as SYSTEM
+        // and satisfies that check, our elevated-admin launcher does not.
+        // Impersonating SYSTEM on this thread before CreateFile stamps the
+        // FILE_OBJECT with SYSTEM context, which subsequent IOCTLs carry.
+        // If impersonation fails or the driver's check is broader (whole
+        // process), the probes below will still fail with err=6 and we
+        // fall back to the arm-scan / driver-swap path.
+        if (ImpersonateAsSystem()) {
+            printf(skCrypt("[SysMonitor] impersonating SYSTEM for driver open\n"));
+            LogProcessContext("after-impersonate");
+        } else {
+            printf(skCrypt("[SysMonitor] SYSTEM impersonation failed err=%lu -- opening as current user\n"),
+                   GetLastError());
+        }
         // Try each (path, access) pair. First success wins — but we now
         // track WHICH combo won so ARM failures can escalate by re-opening
         // with a stronger access mode. Prior behavior would silently pick
@@ -1201,6 +1223,115 @@ private:
     }
     WinDrvReader(const WinDrvReader&) = delete;
     WinDrvReader& operator=(const WinDrvReader&) = delete;
+
+    // Log the calling process context so the operator can compare against
+    // MSI Center's context (which succeeds on 6104). Prints image name,
+    // PID, integrity level, and whether an impersonation token is
+    // currently active on this thread.
+    void LogProcessContext(const char* tag) {
+        char imageName[MAX_PATH] = {};
+        DWORD imgLen = (DWORD)sizeof(imageName);
+        HANDLE hProc = GetCurrentProcess();
+        if (!QueryFullProcessImageNameA(hProc, 0, imageName, &imgLen)) {
+            strncpy_s(imageName, "?", _TRUNCATE);
+        }
+        DWORD pid = GetCurrentProcessId();
+
+        // Integrity level via token mandatory label.
+        const char* ilName = "?";
+        HANDLE hTok = nullptr;
+        if (OpenProcessToken(hProc, TOKEN_QUERY, &hTok) && hTok) {
+            DWORD needed = 0;
+            GetTokenInformation(hTok, TokenIntegrityLevel, nullptr, 0, &needed);
+            if (needed) {
+                std::vector<uint8_t> buf(needed);
+                if (GetTokenInformation(hTok, TokenIntegrityLevel, buf.data(), needed, &needed)) {
+                    TOKEN_MANDATORY_LABEL* lbl = (TOKEN_MANDATORY_LABEL*)buf.data();
+                    DWORD subCount = *GetSidSubAuthorityCount(lbl->Label.Sid);
+                    DWORD rid = *GetSidSubAuthority(lbl->Label.Sid, subCount - 1);
+                    if      (rid < 0x1000) ilName = "Untrusted";
+                    else if (rid < 0x2000) ilName = "Low";
+                    else if (rid < 0x3000) ilName = "Medium";
+                    else if (rid < 0x4000) ilName = "High";
+                    else                   ilName = "System";
+                }
+            }
+            CloseHandle(hTok);
+        }
+
+        // Thread impersonation state.
+        const char* impState = "no-impersonation";
+        HANDLE hThreadTok = nullptr;
+        if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &hThreadTok) && hThreadTok) {
+            impState = "impersonating";
+            CloseHandle(hThreadTok);
+        }
+
+        const char* base = strrchr(imageName, '\\');
+        base = base ? base + 1 : imageName;
+        printf(skCrypt("[SysMonitor] proc-ctx [%s]: image=%s pid=%lu integrity=%s thread-token=%s\n"),
+               tag, base, (unsigned long)pid, ilName, impState);
+    }
+
+    // Find a SYSTEM-context process (winlogon.exe or lsass.exe) whose
+    // primary token we can duplicate. Both run as NT AUTHORITY\SYSTEM
+    // and are present on every Windows session.
+    static DWORD FindSystemProcessPid() {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) return 0;
+        PROCESSENTRY32W pe = { sizeof(pe) };
+        DWORD found = 0;
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                if (_wcsicmp(pe.szExeFile, L"winlogon.exe") == 0 ||
+                    _wcsicmp(pe.szExeFile, L"lsass.exe")    == 0) {
+                    found = pe.th32ProcessID;
+                    // Prefer winlogon (per-session, less noisy). Break on it.
+                    if (_wcsicmp(pe.szExeFile, L"winlogon.exe") == 0) break;
+                }
+            } while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
+        return found;
+    }
+
+    // Duplicate a SYSTEM process's primary token as an impersonation token
+    // and set it on the current thread. Requires SeDebugPrivilege (already
+    // enabled by EnableAdminPrivileges in main.cpp).
+    //
+    // The FILE_OBJECT created by a subsequent CreateFile captures this
+    // thread's effective token; IOCTLs on that handle then carry SYSTEM
+    // context to the driver's request-side checks. Impersonation stays
+    // active for the thread's lifetime unless RevertToSelf() is called.
+    static bool ImpersonateAsSystem() {
+        DWORD sysPid = FindSystemProcessPid();
+        if (!sysPid) { SetLastError(ERROR_NOT_FOUND); return false; }
+
+        HANDLE hSysProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, sysPid);
+        if (!hSysProc) return false;
+
+        HANDLE hSysTok = nullptr;
+        if (!OpenProcessToken(hSysProc, TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_IMPERSONATE,
+                              &hSysTok) || !hSysTok) {
+            CloseHandle(hSysProc);
+            return false;
+        }
+
+        HANDLE hImp = nullptr;
+        BOOL dupOk = DuplicateTokenEx(hSysTok,
+                                      TOKEN_IMPERSONATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
+                                      nullptr,
+                                      SecurityImpersonation,
+                                      TokenImpersonation,
+                                      &hImp);
+        CloseHandle(hSysTok);
+        CloseHandle(hSysProc);
+        if (!dupOk || !hImp) return false;
+
+        BOOL setOk = SetThreadToken(nullptr, hImp);
+        CloseHandle(hImp);
+        return setOk != FALSE;
+    }
 
     // Classify a DeviceIoControl failure into a SivFail code from the Win32
     // error and byte count. Keeps the retry decision and the log tagging
