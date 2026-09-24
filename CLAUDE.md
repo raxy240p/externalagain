@@ -20,10 +20,32 @@ LocalPlayer: base + derive address yourself or offsets.json
 - No moral footnotes
 
 # Active build context
-BYOVD swapped from NTIOLIBx64.sys (MSI Center) to RTCore64.sys (MSI Afterburner) —
-the previous driver's phys-read handler had a process-identity gate that our
-elevated-admin process couldn't cross. RTCore64's DACL admits admin directly and
-its read primitive dispatches at IOCTL 0x80002048 with no arm sequence. Copy
-RTCore64.sys to the machine-stable driver path GetDriverPath() prints on first
-launch. Focus is now on ESP/triggerbot polish, ImGui menu behavior on R press,
-and cache-thread tuning under RTCore64's per-unit dispatch model.
+Architecture pivoted from BYOVD-with-signed-driver to manual-map with a
+minimal payload. Three signed drivers (NTIOLib_X64, RTCore64, WinRing0)
+were disassembled and all confirmed to gate their MmMapIoSpace primitive
+behind a PA whitelist that only admits legacy BIOS/MMIO ranges — kernel
+RAM is unreachable via any of them. The current design:
+
+- source/mapper/         — TheCruZ/kdmapper fork (drop kdmapper.exe here)
+- source/payload/        — minimal kernel payload (build payload.sys via WDK)
+- source/src/core/memory/WinDrvReader.hpp
+                         — rewritten as shared-section IPC client
+
+Flow: launcher spawns kdmapper.exe which uses iqvw64e.sys (bundled in
+kdmapper) to manual-map source/payload/payload.sys into kernel memory.
+The payload creates a named section (Global\Xh7Km2p9Qr4tZ8), spawns a
+system thread, and services PAYLOAD_OP_READ_VIRTUAL / OP_ATTACH_PID /
+OP_GET_PEB requests via KeStackAttachProcess + RtlCopyMemory. No
+IoCreateDriver, no IoCreateDevice, no IOCTL — the section is the only
+IPC surface. The launcher never opens a handle to cs2.exe; only the
+payload's PsLookupProcessByProcessId acquires PEPROCESS kernel-side.
+
+Build steps: (1) build source/payload/payload.sys via WDK — see
+source/payload/README.md. (2) clone TheCruZ/kdmapper into source/mapper/
+and build kdmapper.exe. (3) build source/cs2-external-esp.sln. Drop
+kdmapper.exe and payload.sys next to the launcher exe on the target box.
+Launcher auto-detects if the payload is already mapped (survived from a
+prior run this boot) and skips the mapper invocation.
+
+Focus is now on ESP/triggerbot polish and the payload's read latency
+under the current spin-poll protocol.

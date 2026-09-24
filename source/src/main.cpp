@@ -148,6 +148,99 @@ static bool IsDriverLoaded(DWORD* outErr = nullptr) {
     return ProbeDeviceAllVariants(outErr);
 }
 
+// ── Manual-map payload path (replaces SCM-based driver load) ─────────────────
+//
+// The old flow started a signed BYOVD via SCM. That model's dead — every
+// signed hardware-sensor driver has a PA whitelist (verified via disassembly
+// of NTIOLib, RTCore64, and WinRing0). New flow: TheCruZ/kdmapper.exe
+// exploits iqvw64e.sys to manual-map source/payload/payload.sys into kernel
+// memory. The payload creates a named shared section, spawns a system
+// thread, and services read/write requests without a device object.
+//
+// IsPayloadLoaded checks the shared section presence — that's proof the
+// payload is running and the reader thread is servicing requests.
+static bool IsPayloadLoaded() {
+    HANDLE h = OpenFileMappingA(FILE_MAP_READ, FALSE, PAYLOAD_SECTION_NAME);
+    if (!h) return false;
+    CloseHandle(h);
+    return true;
+}
+
+// Locate mapper + payload alongside our exe. Both must sit next to the
+// launcher on disk: <exe_dir>\kdmapper.exe and <exe_dir>\payload.sys.
+static bool GetSiblingPath(const char* filename, char out[MAX_PATH]) {
+    char self[MAX_PATH] = {};
+    if (!GetModuleFileNameA(nullptr, self, MAX_PATH)) return false;
+    char* slash = strrchr(self, '\\');
+    if (!slash) return false;
+    *slash = '\0';
+    return snprintf(out, MAX_PATH, "%s\\%s", self, filename) < MAX_PATH;
+}
+
+// Spawn kdmapper.exe with payload.sys as its argument. Blocks until the
+// mapper exits. Returns true iff exit code is 0 AND the shared section
+// is now visible.
+static bool LaunchMapper() {
+    if (IsPayloadLoaded()) {
+        std::cout << "  \033[96m[*]\033[0m Payload already mapped (survived from earlier run).\n";
+        return true;
+    }
+
+    char mapper[MAX_PATH] = {};
+    char payload[MAX_PATH] = {};
+    if (!GetSiblingPath("kdmapper.exe", mapper) ||
+        !GetSiblingPath("payload.sys", payload)) {
+        std::cout << "  \033[91m[!]\033[0m Path resolution failed for mapper/payload.\n";
+        return false;
+    }
+    if (GetFileAttributesA(mapper) == INVALID_FILE_ATTRIBUTES) {
+        std::cout << "  \033[91m[!]\033[0m " << mapper << " not found.\n"
+                     "      Build TheCruZ/kdmapper (see source/mapper/README.md) and drop\n"
+                     "      kdmapper.exe next to this launcher.\n";
+        return false;
+    }
+    if (GetFileAttributesA(payload) == INVALID_FILE_ATTRIBUTES) {
+        std::cout << "  \033[91m[!]\033[0m " << payload << " not found.\n"
+                     "      Build the payload (see source/payload/README.md) and drop\n"
+                     "      payload.sys next to this launcher.\n";
+        return false;
+    }
+
+    char cmdline[MAX_PATH * 3] = {};
+    snprintf(cmdline, sizeof(cmdline), "\"%s\" \"%s\"", mapper, payload);
+
+    STARTUPINFOA si{}; si.cb = sizeof(si);
+    si.dwFlags   = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+
+    if (!CreateProcessA(nullptr, cmdline, nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        std::cout << "  \033[91m[!]\033[0m CreateProcess failed err=" << GetLastError() << "\n";
+        return false;
+    }
+    WaitForSingleObject(pi.hProcess, 15000);
+    DWORD ec = 1;
+    GetExitCodeProcess(pi.hProcess, &ec);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    if (ec != 0) {
+        std::cout << "  \033[91m[!]\033[0m kdmapper exit code " << ec
+                  << " -- check its output for BYOVD load failure or blocklist.\n";
+        return false;
+    }
+
+    // Section may take a tick to appear even after mapper exits (payload's
+    // DriverEntry runs after the mapper's exploit thread returns). Poll briefly.
+    for (int i = 0; i < 40; i++) {
+        if (IsPayloadLoaded()) return true;
+        Sleep(50);
+    }
+    std::cout << "  \033[91m[!]\033[0m Mapper reported success but payload section never appeared.\n";
+    return false;
+}
+
 // Case-C recovery: SCM says the service crashed (state=STOPPED) or the
 // device is unopenable after a fresh start. Stop the service if it's
 // stuck and restart it once. Returns true if the restart cycle produced
@@ -768,62 +861,13 @@ int main()
     // breaking the signature. WinDrvReader already knows the constant; no
     // runtime path injection needed.
 
-    // ── Driver loading ────────────────────────────────────────────────────────
-    std::cout << "  \033[96m[*]\033[0m Starting driver...\n";
-    bool drvStarted = StartDriver();
+    // ── Payload loading (manual map via kdmapper) ─────────────────────────────
+    std::cout << "  \033[96m[*]\033[0m Loading payload (manual-map)...\n";
+    bool drvStarted = LaunchMapper();
     if (drvStarted) {
-        // Report what SCM thinks so a "loaded but no device" case shows up
-        // immediately — before the 15-second spinner wait.
-        DWORD state = QueryServiceState(GetSvcName());
-        DWORD probeErr = 0;
-        bool  probeOk  = IsDriverLoaded(&probeErr);
-        std::cout << "  \033[92m[+]\033[0m Driver ready.  service=" << SvcStateName(state)
-                  << "  device=" << (probeOk ? "open" : "unavailable");
-        if (!probeOk) std::cout << " (err=" << probeErr << ")";
-        std::cout << "\n";
-
-        // If the device didn't come up on the first probe, run the three-case
-        // recovery: access-mode fallback (Case B), settle+wait (Case A),
-        // stop/start cycle (Case C). Silent when the first probe already
-        // succeeded so happy-path output stays clean.
-        if (!probeOk) {
-            std::cout << "  \033[96m[*]\033[0m Device not immediately available — running recovery...\n";
-            bool recovered = RecoverDriverDevice(GetSvcName(), 20000);
-            if (recovered) {
-                DWORD st2 = QueryServiceState(GetSvcName());
-                std::cout << "  \033[92m[+]\033[0m Recovery ok.  service=" << SvcStateName(st2) << "  device=open\n";
-            } else {
-                DWORD st2 = QueryServiceState(GetSvcName());
-                DWORD e2 = 0;
-                (void)IsDriverLoaded(&e2);
-                std::cout << "  \033[91m[!]\033[0m Recovery failed.  service=" << SvcStateName(st2)
-                          << "  device err=" << e2 << "\n";
-                if (e2 == 2) {
-                    std::cout << "      → Driver loaded but never published its device object.\n"
-                                 "        RTCore64's DriverEntry publishes \\Device\\RTCore64\n"
-                                 "        unconditionally, so err=2 after a successful service start usually\n"
-                                 "        means HVCI/CI silently blocked the load, an AC DSE hook stripped\n"
-                                 "        device creation, or the on-disk file's signature was altered.\n"
-                                 "        Re-copy RTCore64.sys and check HVCI/blocklist state.\n";
-                } else if (e2 == 5) {
-                    std::cout << "      → Device exists but IRP_MJ_CREATE was rejected (ACCESS_DENIED).\n"
-                                 "        RTCore64's DACL is SYSTEM + Built-in Admins full access. Likely causes for a denial:\n"
-                                 "          1. Not launched from an elevated cmd (admin+UAC-elevated).\n"
-                                 "             Standard user or non-elevated admin gets refused before CREATE.\n"
-                                 "          2. Anti-cheat ObRegisterCallbacksEx hook stripping FILE_ALL_ACCESS\n"
-                                 "             on our device. Close CS2 + any AC tray processes and retry.\n"
-                                 "          3. Windows Defender ASR rule 'Block abuse of exploited vulnerable\n"
-                                 "             signed drivers'. Check: Get-MpPreference |\n"
-                                 "             Select AttackSurfaceReductionRules_Ids\n";
-                }
-            }
-        }
-        std::cout << "\n";
+        std::cout << "  \033[92m[+]\033[0m Payload ready.  section=Global\\Xh7Km2p9Qr4tZ8\n\n";
     } else {
-        std::cout << "  \033[91m[!]\033[0m Driver start failed.\n\n";
-    }
-
-    if (!drvStarted) {
+        std::cout << "  \033[91m[!]\033[0m Payload load failed.\n\n";
         std::cout << "  Press Enter to exit.\n";
         std::cin.get();
         goto exit;
@@ -836,9 +880,8 @@ int main()
         int  spinIdx   = 0;
         const char* sp = "|/-\\";
 
-        DWORD lastDrvErr = 0;
         while (!drvReady || !cs2Ready) {
-            drvReady = IsDriverLoaded(&lastDrvErr);
+            drvReady = IsPayloadLoaded();
             cs2Ready = IsProcessRunning(skCrypt("cs2.exe"));
 
             std::cout
@@ -851,24 +894,10 @@ int main()
             std::cout.flush();
 
             if (!drvReady && waitedMs >= 15000) {
-                // Diagnostic — spell out exactly why the driver looks up as
-                // "not loaded" so the user isn't left guessing.
-                DWORD state = QueryServiceState(GetSvcName());
-                std::cout << "\n\n  \033[91m[!]\033[0m Driver did not load.\n";
-                std::cout << "      Service:        " << GetSvcName() << " (state=" << SvcStateName(state) << ")\n";
-                std::cout << "      Device probe:   " << GetDevicePathUserMode() << "  err=" << lastDrvErr;
-                switch (lastDrvErr) {
-                    case 2:   std::cout << " (ERROR_FILE_NOT_FOUND — driver loaded but never published its device object;\n"
-                                          "                            typically means it's PnP-oriented and needs matching hardware,\n"
-                                          "                            or a policy stripped device creation at load)"; break;
-                    case 5:   std::cout << " (ERROR_ACCESS_DENIED — device exists but its DACL rejects this process)"; break;
-                    case 32:  std::cout << " (ERROR_SHARING_VIOLATION — another handle holds it exclusively)"; break;
-                    case 6:   std::cout << " (ERROR_INVALID_HANDLE — device stack is in a bad state)"; break;
-                    case 21:  std::cout << " (ERROR_NOT_READY — driver still initialising, symlink not yet published)"; break;
-                    case 87:  std::cout << " (ERROR_INVALID_PARAMETER — device path malformed at kernel side)"; break;
-                    case 231: std::cout << " (ERROR_PIPE_BUSY — device serving another client, retry later)"; break;
-                    default:  break;
-                }
+                std::cout << "\n\n  \033[91m[!]\033[0m Payload section vanished after mapper reported success.\n";
+                std::cout << "      Likely causes: payload's reader thread crashed, section was unmapped by\n"
+                             "      an AC scan, or a KAPC_STATE-related bugcheck happened (check the last\n"
+                             "      BSOD).\n";
                 std::cout << "\n\n  Press Enter to exit.\n";
                 std::cin.get();
                 goto exit;
