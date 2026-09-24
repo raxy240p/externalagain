@@ -328,6 +328,22 @@ public:
         uint32_t probe = 0;
         bool ok = NtioReadOnce(0x1000, 4, 1, &probe, sizeof(probe));
 
+        // Empirical fallback: static analysis said 0xC350214C+magic-4bytes
+        // should arm this driver, but dj's live-fire shows the arm state
+        // doesn't stick. Try other candidate IOCTL/buffer combos until
+        // one makes the READ probe succeed. If none does, we still fail
+        // below, but the log identifies which candidates were tried.
+        if (!ok) {
+            printf(skCrypt("[SysMonitor] first probe failed -- running empirical arm-scan\n"));
+            if (ArmScan(m_hDevice)) {
+                ok = true;
+                // Re-run the "canonical" probe path so downstream logic sees
+                // it succeed; ArmScan already validated with its own probe.
+                probe = 0;
+                NtioReadOnce(0x1000, 4, 1, &probe, sizeof(probe));
+            }
+        }
+
         if (!ok) {
             printf(skCrypt("[SysMonitor] NTIOLib probe FAILED (err=%lu) -- driver up + armed but IOCTL 0xC3506104 blocked\n"),
                    GetLastError());
@@ -1199,6 +1215,81 @@ private:
         printf(skCrypt("[SysMonitor] VERSION IOCTL 0xC3502004 -> ok=%d returned=%lu err=%lu value=0x%08X\n"),
                (int)(ok != FALSE), returned, err, (unsigned)buf);
         return ok != FALSE;
+    }
+
+    // Try a candidate arm IOCTL + input pattern, then immediately probe with
+    // a physical read. Returns true if the probe succeeds (i.e., driver is
+    // now armed by whatever we just sent). This is empirical brute force —
+    // static analysis of the driver says 0xC350214C with 4-byte magic should
+    // arm, but it doesn't stick on dj's build. Try alternate encodings the
+    // MSI codebase might expect.
+    bool TryArmVariant(HANDLE h, uint32_t ioctlCode, const void* inBuf, size_t inSize,
+                       size_t outSize, const char* tag)
+    {
+        // Send the candidate arm IOCTL
+        uint8_t out[64] = {};
+        DWORD returned = 0;
+        SetLastError(0);
+        BOOL ok = DeviceIoControl(h, ioctlCode,
+                                  const_cast<void*>(inBuf), (DWORD)inSize,
+                                  out, (DWORD)outSize,
+                                  &returned, nullptr);
+        DWORD armErr = GetLastError();
+
+        // Probe: try reading 4 bytes from PA 0x1000 via READ_PHYS
+        struct { uint64_t pa; uint32_t unit; uint32_t cnt; } req = { 0x1000, 4, 1 };
+        uint32_t probe = 0;
+        DWORD probeReturned = 0;
+        SetLastError(0);
+        BOOL probeOk = DeviceIoControl(h, IOCTL_NTIO_READ_PHYS,
+                                       &req, sizeof(req),
+                                       &probe, sizeof(probe),
+                                       &probeReturned, nullptr);
+        DWORD probeErr = GetLastError();
+
+        printf(skCrypt("[SysMonitor] arm-scan [%s]: IOCTL 0x%08X in=%zu out=%zu -> ok=%d err=%lu ; "
+                       "probe -> ok=%d err=%lu value=0x%08X\n"),
+               tag, (unsigned)ioctlCode, inSize, outSize,
+               (int)(ok != FALSE), armErr,
+               (int)(probeOk != FALSE), probeErr, (unsigned)probe);
+
+        return probeOk != FALSE;
+    }
+
+    // Empirical arm scan — cycle through candidate arm sequences until one
+    // makes the READ probe succeed. Only called from Open() after the
+    // static-analysis path fails.
+    bool ArmScan(HANDLE h) {
+        printf(skCrypt("[SysMonitor] arm-scan: probing 8 arm candidates...\n"));
+        // Reset m_armed each time so NtioReadOnce doesn't short-circuit
+        m_armed.store(false, std::memory_order_release);
+
+        struct Candidate {
+            uint32_t code;
+            uint32_t bufWords[4];   // up to 4 dwords of input
+            size_t   inWords;
+            size_t   outSize;
+            const char* tag;
+        };
+        const uint32_t M = NTIO_ARM_MAGIC;
+        Candidate cands[] = {
+            { 0xC350214Cu, {M, 0, 0, 0}, 1, 4,  "214C-4byte" },
+            { 0xC350214Cu, {M, M, 0, 0}, 2, 8,  "214C-8byte" },
+            { 0xC350214Cu, {M, 0, 0, 0}, 1, 16, "214C-in4-out16" },
+            { 0xC3502084u, {M, 0, 0, 0}, 1, 4,  "2084-4byte" },
+            { 0xC3502088u, {M, 0, 0, 0}, 1, 4,  "2088-4byte" },
+            { 0xC3502004u, {M, 0, 0, 0}, 1, 4,  "2004-4byte" },
+            { 0xC350214Cu, {M, M, M, M}, 4, 16, "214C-16byte" },
+            { 0xC3502000u, {M, 0, 0, 0}, 1, 4,  "2000-4byte" },
+        };
+        for (auto& c : cands) {
+            if (TryArmVariant(h, c.code, c.bufWords, c.inWords * 4, c.outSize, c.tag)) {
+                m_armed.store(true, std::memory_order_release);
+                printf(skCrypt("[SysMonitor] arm-scan WON with [%s]\n"), c.tag);
+                return true;
+            }
+        }
+        return false;
     }
 
     // Retry wrapper called from Open. Some NTIOLib builds initialize their
